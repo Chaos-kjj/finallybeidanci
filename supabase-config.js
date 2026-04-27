@@ -1,0 +1,4 @@
+window.KANGKANG_SUPABASE_URL = "";
+window.KANGKANG_SUPABASE_ANON_KEY = "";
+window.KANGKANG_SUPABASE_STATE_TABLE = "user_app_state";
+window.KANGKANG_SUPABASE_READER_BOOKS_TABLE = "user_reader_books";
