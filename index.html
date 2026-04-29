@@ -3112,6 +3112,10 @@
         const CLOUD_SYNC_DEBOUNCE_MS = 900;
         const READER_PROGRESS_SAVE_DEBOUNCE_MS = 650;
         const READER_PROGRESS_SAVE_THROTTLE_MS = 5000;
+        const READER_SCROLL_WINDOW_RADIUS = 1;
+        const READER_SCROLL_EDGE_PX = 180;
+        const READER_MIN_VIRTUAL_PAGE_HEIGHT = 420;
+        const READER_LAYOUT_CACHE_LIMIT = 4;
 
         const DEFAULT_READER_SETTINGS = Object.freeze({
             font: 'Georgia, serif',
@@ -3500,10 +3504,19 @@
         let currentReaderParagraphs = [];
         let currentReaderPages = [];
         let currentReaderPageIndex = 0;
+        let currentReaderVirtualPageIndex = 0;
+        let currentReaderNotesByParagraph = new Map();
+        let currentReaderTokenCache = new Map();
+        let currentReaderHighlightedSet = new Set();
+        let readerLayoutCache = new Map();
+        let readerVirtualPageHeights = [];
+        let readerVirtualWindow = { startPage: 0, endPage: 0, topHeight: 0, bottomHeight: 0 };
+        let readerVirtualScrollApplying = false;
         let readerTokenCounter = 0;
         let readerProgressSaveTimer = null;
         let readerProgressThrottleTimer = null;
         let lastReaderProgressPersistAt = 0;
+        let lastReaderBookProgressSaveAt = 0;
         let readerNoteFlashTimer = null;
         let readerErrataFlashTimer = null;
         let homeCalendarCursor = new Date();
@@ -3563,6 +3576,13 @@
             currentReaderParagraphs = [];
             currentReaderPages = [];
             currentReaderPageIndex = 0;
+            currentReaderVirtualPageIndex = 0;
+            currentReaderNotesByParagraph = new Map();
+            currentReaderTokenCache = new Map();
+            currentReaderHighlightedSet = new Set();
+            readerVirtualPageHeights = [];
+            readerVirtualWindow = { startPage: 0, endPage: 0, topHeight: 0, bottomHeight: 0 };
+            readerVirtualScrollApplying = false;
         }
 
         function getAppStatePayload() {
@@ -3698,6 +3718,22 @@
             } catch (error) {
                 console.warn('Cloud dirty marker clear failed:', error);
             }
+        }
+
+        function readCloudSyncDirty() {
+            try {
+                const dirty = JSON.parse(localStorage.getItem(LOCAL_STORAGE_KEY_CLOUD_DIRTY) || '{}');
+                return dirty && typeof dirty === 'object' ? dirty : {};
+            } catch (error) {
+                console.warn('Cloud dirty marker read failed:', error);
+                return {};
+            }
+        }
+
+        function isLocalDirtyNewerThan(remoteSavedAt) {
+            const dirtyAt = getTimestampMs(readCloudSyncDirty().updatedAt);
+            const remoteAt = getTimestampMs(remoteSavedAt);
+            return dirtyAt > 0 && dirtyAt > remoteAt;
         }
 
         function scheduleCloudSync(reason = 'state-change', options = {}) {
@@ -4215,8 +4251,15 @@
             }
 
             setCloudSyncStatus('检测到其他设备更新，正在恢复...');
+            const keepLocalProgressAuthoritative = isLocalDirtyNewerThan(remoteSavedAt);
             await hydrateLocalFromCloudData(data);
             await refreshUiAfterCloudHydrate();
+            if (keepLocalProgressAuthoritative) {
+                scheduleCloudSync('local-newer-than-remote', { immediate: true }).catch(error => {
+                    console.error('Local-newer cloud resync failed:', error);
+                    setCloudSyncStatus(`Local progress resync failed: ${error.message}`, true);
+                });
+            }
             setCloudSyncStatus(`已恢复其他设备记录 ${formatSyncTime(new Date(remoteSavedAt || Date.now()))}`);
         }
 
@@ -5787,8 +5830,10 @@
                     books: storage.books || {}
                 }));
                 if (syncCloud) scheduleCloudSync(reason);
+                return true;
             } catch (error) {
-                console.error('Reader progress save failed:', error);
+                reportReaderProgressSaveError(error, 'local');
+                return false;
             }
         }
 
@@ -6012,7 +6057,7 @@
         }
 
         async function initializeReaderView() {
-            applyReaderSettings();
+            applyReaderSettings({ rerender: false });
             await refreshReaderBooks();
         }
 
@@ -6045,6 +6090,14 @@
 
         function renderReaderEmpty() {
             currentReaderBook = null;
+            currentReaderParagraphs = [];
+            currentReaderPages = [];
+            currentReaderPageIndex = 0;
+            currentReaderVirtualPageIndex = 0;
+            currentReaderNotesByParagraph = new Map();
+            currentReaderTokenCache = new Map();
+            currentReaderHighlightedSet = new Set();
+            readerVirtualPageHeights = [];
             readerEmpty.classList.remove('hidden');
             readerBookTitle.classList.add('hidden');
             readerContent.innerHTML = '';
@@ -6066,23 +6119,28 @@
             readerSettings.lastBookId = currentReaderBook.id;
             saveReaderSettings();
             saveReaderProgressLocally(currentReaderBook, savedProgress);
+            currentReaderHighlightedSet = new Set(currentReaderBook.highlightedOccurrences || []);
+            currentReaderNotesByParagraph = buildReaderNotesByParagraph(currentReaderBook);
+            currentReaderTokenCache = new Map();
             readerEmpty.classList.add('hidden');
             readerBookTitle.classList.remove('hidden');
             readerBookTitle.textContent = book.title;
             hideReaderPopover();
-            currentReaderParagraphs = splitBookIntoParagraphs(book.text);
-            currentReaderPages = buildReaderPages(currentReaderParagraphs);
-            currentReaderPageIndex = Math.min(
-                Math.max(0, currentReaderBook.progress?.pageIndex || 0),
-                Math.max(0, currentReaderPages.length - 1)
-            );
+            const layout = getReaderBookLayout(book);
+            currentReaderParagraphs = layout.paragraphs;
+            currentReaderPages = layout.pages;
+            initializeReaderVirtualPageHeights();
+            currentReaderPageIndex = getReaderPageIndexFromProgress(currentReaderBook.progress);
+            currentReaderVirtualPageIndex = currentReaderPageIndex;
             renderReaderPageContent();
             restoreReaderProgress();
             if (readerNotesPanel && !readerNotesPanel.classList.contains('hidden')) renderReaderNotesPanel();
             if (readerBookErrataPanel && !readerBookErrataPanel.classList.contains('hidden')) renderReaderBookErrataPanel();
         }
 
-        function renderReaderPageContent() {
+        function renderReaderPageContent(options = {}) {
+            const { preserveScroll = false } = options;
+            const previousScrollTop = preserveScroll ? readerStage.scrollTop : null;
             readerContent.innerHTML = '';
             readerTokenCounter = 0;
 
@@ -6091,23 +6149,60 @@
                 return;
             }
 
-            const paragraphsToRender = readerSettings.flow === 'paged'
-                ? (currentReaderPages[currentReaderPageIndex] || [])
-                : currentReaderParagraphs;
+            if (readerSettings.flow !== 'paged') {
+                renderReaderScrollWindowContent();
+                if (previousScrollTop !== null) {
+                    readerVirtualScrollApplying = true;
+                    readerStage.scrollTop = previousScrollTop;
+                    requestAnimationFrame(() => {
+                        readerVirtualScrollApplying = false;
+                        updateReaderProgressDisplay();
+                    });
+                }
+                updateReaderProgressDisplay();
+                return;
+            }
+
+            const paragraphsToRender = currentReaderPages[currentReaderPageIndex] || [];
 
             const fragment = document.createDocumentFragment();
             paragraphsToRender.forEach((paragraph, paragraphIndex) => {
                 const p = document.createElement('p');
-                const absoluteParagraphIndex = readerSettings.flow === 'paged'
-                    ? (currentReaderPages[currentReaderPageIndex]?.startIndex || 0) + paragraphIndex
-                    : paragraphIndex;
+                const absoluteParagraphIndex = (currentReaderPages[currentReaderPageIndex]?.startIndex || 0) + paragraphIndex;
                 p.dataset.paragraphIndex = String(absoluteParagraphIndex);
+                p.dataset.readerPageIndex = String(currentReaderPageIndex);
                 appendAnnotatedReaderText(p, paragraph, absoluteParagraphIndex);
                 fragment.appendChild(p);
             });
             readerContent.appendChild(fragment);
-            updateReaderErrataHighlights();
             updateReaderProgressDisplay();
+        }
+
+        function getReaderBookLayout(book) {
+            const cacheKey = getReaderBookLayoutCacheKey(book);
+            const cached = readerLayoutCache.get(cacheKey);
+            if (cached) return cached;
+
+            const paragraphs = splitBookIntoParagraphs(book?.text || '');
+            const pages = buildReaderPages(paragraphs);
+            const layout = { paragraphs, pages };
+            readerLayoutCache.set(cacheKey, layout);
+            while (readerLayoutCache.size > READER_LAYOUT_CACHE_LIMIT) {
+                const oldestKey = readerLayoutCache.keys().next().value;
+                readerLayoutCache.delete(oldestKey);
+            }
+            return layout;
+        }
+
+        function getReaderBookLayoutCacheKey(book) {
+            const text = String(book?.text || '');
+            const textMarker = `${text.length}:${text.slice(0, 500)}:${text.slice(-500)}`;
+            return [
+                book?.id || '',
+                book?.bookKey || '',
+                book?.fileHash || '',
+                hashReaderString(textMarker)
+            ].join('|');
         }
 
         function buildReaderPages(paragraphs) {
@@ -6137,6 +6232,172 @@
             return pages.length ? pages : [[]];
         }
 
+        function buildReaderNotesByParagraph(book = currentReaderBook) {
+            const byParagraph = new Map();
+            getSortedReaderNotes(book).forEach(note => {
+                const paragraphIndex = Number(note?.anchor?.paragraphIndex);
+                if (!Number.isFinite(paragraphIndex)) return;
+                const key = Math.max(0, Math.round(paragraphIndex));
+                if (!byParagraph.has(key)) byParagraph.set(key, []);
+                byParagraph.get(key).push(note);
+            });
+            byParagraph.forEach(notes => notes.sort(compareReaderNotesByPosition));
+            return byParagraph;
+        }
+
+        function getReaderNotesForParagraph(paragraphIndex) {
+            return currentReaderNotesByParagraph.get(Number(paragraphIndex)) || [];
+        }
+
+        function initializeReaderVirtualPageHeights() {
+            readerVirtualPageHeights = currentReaderPages.map(page => estimateReaderVirtualPageHeight(page));
+            if (!readerVirtualPageHeights.length) readerVirtualPageHeights = [READER_MIN_VIRTUAL_PAGE_HEIGHT];
+            readerVirtualWindow = { startPage: 0, endPage: 0, topHeight: 0, bottomHeight: 0 };
+        }
+
+        function estimateReaderVirtualPageHeight(page) {
+            const fontSize = Number(readerSettings.fontSize) || 20;
+            const lineHeight = fontSize * (Number(readerSettings.lineHeight) || 1.75);
+            const stageWidth = Math.max(280, (readerStage?.clientWidth || 720) - 64);
+            const charsPerLine = Math.max(24, Math.floor(stageWidth / Math.max(8, fontSize * 0.52)));
+            const lineCount = (page || []).reduce((sum, paragraph) => {
+                return sum + Math.max(1, Math.ceil(String(paragraph || '').length / charsPerLine)) + 0.7;
+            }, 0);
+            return Math.max(READER_MIN_VIRTUAL_PAGE_HEIGHT, Math.ceil(lineCount * lineHeight));
+        }
+
+        function getReaderTotalVirtualHeight() {
+            return readerVirtualPageHeights.reduce((sum, height) => sum + Math.max(1, Number(height) || READER_MIN_VIRTUAL_PAGE_HEIGHT), 0);
+        }
+
+        function getReaderVirtualOffsetBeforePage(pageIndex) {
+            const end = Math.min(Math.max(0, pageIndex), readerVirtualPageHeights.length);
+            let offset = 0;
+            for (let index = 0; index < end; index += 1) {
+                offset += Math.max(1, Number(readerVirtualPageHeights[index]) || READER_MIN_VIRTUAL_PAGE_HEIGHT);
+            }
+            return offset;
+        }
+
+        function getReaderVirtualPageIndexFromScroll(scrollTop) {
+            const target = Math.max(0, Number(scrollTop) || 0);
+            let offset = 0;
+            for (let index = 0; index < readerVirtualPageHeights.length; index += 1) {
+                offset += Math.max(1, Number(readerVirtualPageHeights[index]) || READER_MIN_VIRTUAL_PAGE_HEIGHT);
+                if (target < offset) return index;
+            }
+            return Math.max(0, readerVirtualPageHeights.length - 1);
+        }
+
+        function getReaderPageIndexFromProgress(progress = currentReaderBook?.progress) {
+            const pageCount = Math.max(1, currentReaderPages.length);
+            const normalized = normalizeReaderProgress(progress);
+            if (!normalized) return 0;
+            if (normalized.flow === 'paged' || normalized.pageIndex > 0) {
+                return Math.min(pageCount - 1, Math.max(0, normalized.pageIndex || 0));
+            }
+            if (normalized.scrollTop > 0 && readerVirtualPageHeights.length) {
+                return Math.min(pageCount - 1, Math.max(0, getReaderVirtualPageIndexFromScroll(normalized.scrollTop)));
+            }
+            const pageFromPercent = Math.floor((normalized.percent / 100) * (pageCount - 1));
+            return Math.min(pageCount - 1, Math.max(0, pageFromPercent || 0));
+        }
+
+        function getReaderScrollWindowRange() {
+            const pageCount = Math.max(1, currentReaderPages.length);
+            const center = Math.min(pageCount - 1, Math.max(0, currentReaderVirtualPageIndex));
+            return {
+                startPage: Math.max(0, center - READER_SCROLL_WINDOW_RADIUS),
+                endPage: Math.min(pageCount - 1, center + READER_SCROLL_WINDOW_RADIUS)
+            };
+        }
+
+        function renderReaderScrollWindowContent() {
+            const { startPage, endPage } = getReaderScrollWindowRange();
+            const fragment = document.createDocumentFragment();
+            const topHeight = getReaderVirtualOffsetBeforePage(startPage);
+            const bottomHeight = Math.max(0, getReaderTotalVirtualHeight() - getReaderVirtualOffsetBeforePage(endPage + 1));
+            const topSpacer = document.createElement('div');
+            topSpacer.className = 'reader-virtual-spacer reader-virtual-spacer-top';
+            topSpacer.style.height = `${Math.max(0, Math.round(topHeight))}px`;
+            topSpacer.setAttribute('aria-hidden', 'true');
+            fragment.appendChild(topSpacer);
+
+            for (let pageIndex = startPage; pageIndex <= endPage; pageIndex += 1) {
+                const page = currentReaderPages[pageIndex] || [];
+                page.forEach((paragraph, paragraphIndex) => {
+                    const p = document.createElement('p');
+                    const absoluteParagraphIndex = (page.startIndex || 0) + paragraphIndex;
+                    p.dataset.paragraphIndex = String(absoluteParagraphIndex);
+                    p.dataset.readerPageIndex = String(pageIndex);
+                    appendAnnotatedReaderText(p, paragraph, absoluteParagraphIndex);
+                    fragment.appendChild(p);
+                });
+            }
+
+            const bottomSpacer = document.createElement('div');
+            bottomSpacer.className = 'reader-virtual-spacer reader-virtual-spacer-bottom';
+            bottomSpacer.style.height = `${Math.max(0, Math.round(bottomHeight))}px`;
+            bottomSpacer.setAttribute('aria-hidden', 'true');
+            fragment.appendChild(bottomSpacer);
+
+            readerVirtualWindow = { startPage, endPage, topHeight, bottomHeight };
+            readerContent.appendChild(fragment);
+            requestAnimationFrame(measureReaderRenderedVirtualPages);
+        }
+
+        function measureReaderRenderedVirtualPages() {
+            if (!currentReaderBook || readerSettings.flow === 'paged') return;
+            const measured = new Map();
+            readerContent.querySelectorAll('p[data-reader-page-index]').forEach(paragraph => {
+                const pageIndex = Number(paragraph.dataset.readerPageIndex);
+                if (!Number.isFinite(pageIndex)) return;
+                const style = window.getComputedStyle(paragraph);
+                const margin = (parseFloat(style.marginTop) || 0) + (parseFloat(style.marginBottom) || 0);
+                measured.set(pageIndex, (measured.get(pageIndex) || 0) + paragraph.offsetHeight + margin);
+            });
+            if (!measured.size) return;
+
+            const oldTopHeight = readerVirtualWindow.topHeight;
+            measured.forEach((height, pageIndex) => {
+                readerVirtualPageHeights[pageIndex] = Math.max(READER_MIN_VIRTUAL_PAGE_HEIGHT, Math.ceil(height + 24));
+            });
+            const nextTopHeight = getReaderVirtualOffsetBeforePage(readerVirtualWindow.startPage);
+            const nextBottomHeight = Math.max(0, getReaderTotalVirtualHeight() - getReaderVirtualOffsetBeforePage(readerVirtualWindow.endPage + 1));
+            const topSpacer = readerContent.querySelector('.reader-virtual-spacer-top');
+            const bottomSpacer = readerContent.querySelector('.reader-virtual-spacer-bottom');
+            if (topSpacer) topSpacer.style.height = `${Math.max(0, Math.round(nextTopHeight))}px`;
+            if (bottomSpacer) bottomSpacer.style.height = `${Math.max(0, Math.round(nextBottomHeight))}px`;
+            readerVirtualWindow.topHeight = nextTopHeight;
+            readerVirtualWindow.bottomHeight = nextBottomHeight;
+            if (Math.abs(nextTopHeight - oldTopHeight) > 1 && readerStage.scrollTop > 0) {
+                readerVirtualScrollApplying = true;
+                readerStage.scrollTop += nextTopHeight - oldTopHeight;
+                requestAnimationFrame(() => {
+                    readerVirtualScrollApplying = false;
+                    updateReaderProgressDisplay();
+                });
+            } else {
+                updateReaderProgressDisplay();
+            }
+        }
+
+        function handleReaderVirtualScroll() {
+            if (!currentReaderBook || readerSettings.flow === 'paged' || readerVirtualScrollApplying) return false;
+            const nextPageIndex = getReaderVirtualPageIndexFromScroll(readerStage.scrollTop);
+            const nearTop = readerStage.scrollTop < readerVirtualWindow.topHeight + READER_SCROLL_EDGE_PX;
+            const nearBottom = readerStage.scrollTop + readerStage.clientHeight > getReaderVirtualOffsetBeforePage(readerVirtualWindow.endPage + 1) - READER_SCROLL_EDGE_PX;
+            if (nextPageIndex === currentReaderVirtualPageIndex && !nearTop && !nearBottom) return false;
+
+            currentReaderVirtualPageIndex = nextPageIndex;
+            const { startPage, endPage } = getReaderScrollWindowRange();
+            if (startPage !== readerVirtualWindow.startPage || endPage !== readerVirtualWindow.endPage) {
+                renderReaderPageContent({ preserveScroll: true });
+                return true;
+            }
+            return false;
+        }
+
         function splitBookIntoParagraphs(text) {
             return String(text || '')
                 .replace(/\r\n/g, '\n')
@@ -6147,7 +6408,7 @@
 
         function appendAnnotatedReaderText(container, text, paragraphIndex = 0) {
             const paragraph = String(text || '');
-            const tokens = getReaderTokens(paragraph);
+            const tokens = getReaderTokensForParagraph(paragraphIndex, paragraph);
             const noteRanges = getResolvedReaderNoteRangesForParagraph(paragraphIndex, paragraph);
 
             if (!noteRanges.length) {
@@ -6198,6 +6459,15 @@
             return tokens;
         }
 
+        function getReaderTokensForParagraph(paragraphIndex, paragraph) {
+            const key = String(paragraphIndex);
+            const cached = currentReaderTokenCache.get(key);
+            if (cached && cached.text === paragraph) return cached.tokens;
+            const tokens = getReaderTokens(paragraph);
+            currentReaderTokenCache.set(key, { text: paragraph, tokens });
+            return tokens;
+        }
+
         function appendTokenizedRange(container, paragraph, start, end, paragraphIndex, tokens) {
             let lastIndex = start;
             tokens.forEach(token => {
@@ -6210,9 +6480,11 @@
 
                 const span = document.createElement('span');
                 span.className = 'reader-word';
+                const tokenIndex = `${paragraphIndex}:${token.wordIndex}`;
+                if (currentReaderHighlightedSet.has(tokenIndex)) span.classList.add('reader-known-errata');
                 span.textContent = token.text;
                 span.dataset.word = token.normalized;
-                span.dataset.tokenIndex = `${paragraphIndex}:${token.wordIndex}`;
+                span.dataset.tokenIndex = tokenIndex;
                 span.dataset.paragraphIndex = String(paragraphIndex);
                 span.dataset.startOffset = String(token.start);
                 span.dataset.endOffset = String(token.end);
@@ -6314,7 +6586,7 @@
         }
 
         function getResolvedReaderNoteRangesForParagraph(paragraphIndex, paragraph) {
-            const ranges = getSortedReaderNotes()
+            const ranges = getReaderNotesForParagraph(paragraphIndex)
                 .map(note => {
                     const range = resolveReaderNoteRange(note, paragraphIndex, paragraph);
                     return range ? { note, ...range } : null;
@@ -6393,9 +6665,9 @@
         }
 
         function updateReaderErrataHighlights() {
-            const highlightedSet = new Set(currentReaderBook?.highlightedOccurrences || []);
+            currentReaderHighlightedSet = new Set(currentReaderBook?.highlightedOccurrences || []);
             readerContent.querySelectorAll('.reader-word').forEach(el => {
-                el.classList.toggle('reader-known-errata', highlightedSet.has(el.dataset.tokenIndex));
+                el.classList.toggle('reader-known-errata', currentReaderHighlightedSet.has(el.dataset.tokenIndex));
             });
         }
 
@@ -6455,12 +6727,7 @@
             currentReaderBook.progress = progress;
             if (readerSettings.flow === 'paged') {
                 const pageCount = Math.max(1, currentReaderPages.length);
-                const pageFromPercent = Math.floor((progress.percent / 100) * (pageCount - 1));
-                const targetPageIndex = progress.flow === 'paged' ? progress.pageIndex : pageFromPercent;
-                const nextPageIndex = Math.min(
-                    Math.max(0, targetPageIndex || 0),
-                    Math.max(0, pageCount - 1)
-                );
+                const nextPageIndex = Math.min(Math.max(0, getReaderPageIndexFromProgress(progress)), Math.max(0, pageCount - 1));
                 if (nextPageIndex !== currentReaderPageIndex) {
                     currentReaderPageIndex = nextPageIndex;
                     renderReaderPageContent();
@@ -6471,10 +6738,18 @@
             }
 
             const applyScrollProgress = () => {
+                const targetPageIndex = getReaderPageIndexFromProgress(progress);
+                if (targetPageIndex !== currentReaderVirtualPageIndex) {
+                    currentReaderVirtualPageIndex = targetPageIndex;
+                    renderReaderPageContent();
+                }
                 const maxScroll = Math.max(0, readerStage.scrollHeight - readerStage.clientHeight);
                 const scrollFromPercent = Math.round((progress.percent / 100) * maxScroll);
                 const targetScrollTop = progress.scrollTop > 0 ? progress.scrollTop : scrollFromPercent;
+                readerVirtualScrollApplying = true;
                 readerStage.scrollTop = Math.min(maxScroll, Math.max(0, targetScrollTop));
+                currentReaderVirtualPageIndex = getReaderVirtualPageIndexFromScroll(readerStage.scrollTop);
+                readerVirtualScrollApplying = false;
                 updateReaderProgressDisplay();
             };
 
@@ -6486,19 +6761,53 @@
 
         function scheduleReaderProgressSave() {
             updateReaderProgressDisplay();
+            saveCurrentReaderProgressLocal({ syncCloud: true, reason: 'reader-progress' });
             if (readerProgressSaveTimer) clearTimeout(readerProgressSaveTimer);
-            readerProgressSaveTimer = setTimeout(() => persistReaderProgress(), READER_PROGRESS_SAVE_DEBOUNCE_MS);
+            readerProgressSaveTimer = setTimeout(() => {
+                persistReaderProgress({ syncCloud: false, reason: 'reader-progress-indexeddb' });
+            }, READER_PROGRESS_SAVE_DEBOUNCE_MS);
 
-            const elapsed = Date.now() - lastReaderProgressPersistAt;
+            const elapsed = Date.now() - lastReaderBookProgressSaveAt;
             if (elapsed >= READER_PROGRESS_SAVE_THROTTLE_MS) {
-                persistReaderProgress();
+                persistReaderProgress({ syncCloud: false, reason: 'reader-progress-throttle' });
                 return;
             }
             if (!readerProgressThrottleTimer) {
                 readerProgressThrottleTimer = setTimeout(() => {
                     readerProgressThrottleTimer = null;
-                    persistReaderProgress();
+                    persistReaderProgress({ syncCloud: false, reason: 'reader-progress-throttle' });
                 }, Math.max(250, READER_PROGRESS_SAVE_THROTTLE_MS - elapsed));
+            }
+        }
+
+        function captureReaderProgress(now = new Date().toISOString()) {
+            return {
+                flow: readerSettings.flow || 'scroll',
+                scrollTop: Math.max(0, Math.round(readerStage.scrollTop || 0)),
+                pageIndex: readerSettings.flow === 'paged' ? currentReaderPageIndex : currentReaderVirtualPageIndex,
+                percent: getReaderProgressPercent(),
+                updatedAt: now
+            };
+        }
+
+        function saveCurrentReaderProgressLocal(options = {}) {
+            const { syncCloud = true, reason = 'reader-progress' } = options;
+            if (!currentReaderBook) return null;
+            const progress = captureReaderProgress();
+            currentReaderBook = { ...currentReaderBook, progress, updatedAt: Date.now() };
+            lastReaderProgressPersistAt = Date.now();
+            saveReaderProgressLocally(currentReaderBook, progress, { syncCloud, reason });
+            const index = readerBooks.findIndex(book => book.id === currentReaderBook.id);
+            if (index > -1) readerBooks[index] = currentReaderBook;
+            return progress;
+        }
+
+        function reportReaderProgressSaveError(error, phase = 'local') {
+            console.error(`Reader progress ${phase} save failed:`, error);
+            const message = `Reader progress save failed: ${error?.message || error}`;
+            setCloudSyncStatus(message, true);
+            if (readerProgressLabel && currentAppSection === 'reader') {
+                readerProgressLabel.textContent = message;
             }
         }
 
@@ -6513,20 +6822,13 @@
                 clearTimeout(readerProgressThrottleTimer);
                 readerProgressThrottleTimer = null;
             }
-            const now = new Date().toISOString();
-            const progress = {
-                flow: readerSettings.flow || 'scroll',
-                scrollTop: Math.max(0, Math.round(readerStage.scrollTop || 0)),
-                pageIndex: currentReaderPageIndex,
-                percent: getReaderProgressPercent(),
-                updatedAt: now
-            };
-            currentReaderBook = { ...currentReaderBook, progress, updatedAt: Date.now() };
-            lastReaderProgressPersistAt = Date.now();
-            saveReaderProgressLocally(currentReaderBook, progress, { syncCloud, reason });
-            const index = readerBooks.findIndex(book => book.id === currentReaderBook.id);
-            if (index > -1) readerBooks[index] = currentReaderBook;
-            await saveBook(currentReaderBook, { syncCloud: false });
+            try {
+                saveCurrentReaderProgressLocal({ syncCloud, reason });
+                await saveBook(currentReaderBook, { syncCloud: false });
+                lastReaderBookProgressSaveAt = Date.now();
+            } catch (error) {
+                reportReaderProgressSaveError(error, 'indexeddb');
+            }
             if (flushCloud) await flushCloudSync(reason);
         }
 
@@ -6551,6 +6853,7 @@
             const nextIndex = Math.min(pageCount - 1, Math.max(0, currentReaderPageIndex + delta));
             if (nextIndex === currentReaderPageIndex) return;
             currentReaderPageIndex = nextIndex;
+            currentReaderVirtualPageIndex = nextIndex;
             hideReaderPopover();
             renderReaderPageContent();
             readerStage.scrollTop = 0;
@@ -6577,7 +6880,8 @@
             scheduleCloudSync('reader-settings');
         }
 
-        function applyReaderSettings() {
+        function applyReaderSettings(options = {}) {
+            const { rerender = true } = options;
             readerStage.style.setProperty('--reader-font', readerSettings.font);
             readerStage.style.setProperty('--reader-size', `${readerSettings.fontSize}px`);
             readerStage.style.setProperty('--reader-line-height', readerSettings.lineHeight);
@@ -6585,7 +6889,9 @@
             readerStage.classList.add(`reader-theme-${readerSettings.theme}`);
             readerStage.classList.toggle('reader-flow-paged', readerSettings.flow === 'paged');
             readerStage.classList.toggle('reader-flow-scroll', readerSettings.flow !== 'paged');
-            if (currentReaderBook) {
+            if (currentReaderBook && rerender) {
+                initializeReaderVirtualPageHeights();
+                currentReaderVirtualPageIndex = getReaderPageIndexFromProgress(currentReaderBook.progress);
                 renderReaderPageContent();
                 restoreReaderProgress();
             }
@@ -6938,7 +7244,7 @@
                     const position = parseReaderTokenIndex(tokenIndex);
                     if (!position) return null;
                     const paragraphText = getReaderParagraphText(position.paragraphIndex);
-                    const token = getReaderTokens(paragraphText)[position.wordIndex];
+                    const token = getReaderTokensForParagraph(position.paragraphIndex, paragraphText)[position.wordIndex];
                     if (!token) return null;
                     return {
                         tokenIndex,
@@ -7121,6 +7427,7 @@
             notes.push(note);
             notes.sort(compareReaderNotesByPosition);
             currentReaderBook = { ...currentReaderBook, notes, updatedAt: Date.now() };
+            currentReaderNotesByParagraph = buildReaderNotesByParagraph(currentReaderBook);
             const index = readerBooks.findIndex(book => book.id === currentReaderBook.id);
             if (index > -1) readerBooks[index] = currentReaderBook;
 
@@ -7140,6 +7447,7 @@
             if (!note || !currentReaderBook) return;
             const notes = getSortedReaderNotes().filter(item => item.id !== note.id);
             currentReaderBook = { ...currentReaderBook, notes, updatedAt: Date.now() };
+            currentReaderNotesByParagraph = buildReaderNotesByParagraph(currentReaderBook);
             const index = readerBooks.findIndex(book => book.id === currentReaderBook.id);
             if (index > -1) readerBooks[index] = currentReaderBook;
 
@@ -7169,18 +7477,29 @@
             });
         }
 
+        function ensureReaderPageVisibleForParagraph(paragraphIndex) {
+            const pageIndex = getReaderPageIndexForParagraph(paragraphIndex);
+            if (pageIndex < 0) return;
+            if (readerSettings.flow === 'paged') {
+                if (pageIndex !== currentReaderPageIndex) {
+                    currentReaderPageIndex = pageIndex;
+                    currentReaderVirtualPageIndex = pageIndex;
+                    renderReaderPageContent();
+                    readerStage.scrollTop = 0;
+                }
+                return;
+            }
+
+            currentReaderVirtualPageIndex = pageIndex;
+            renderReaderPageContent();
+            readerStage.scrollTop = getReaderVirtualOffsetBeforePage(pageIndex);
+        }
+
         function jumpToReaderNote(noteId) {
             const note = getReaderNoteById(noteId);
             if (!note) return;
             const paragraphIndex = Number(note.anchor?.paragraphIndex);
-            if (readerSettings.flow === 'paged') {
-                const pageIndex = getReaderPageIndexForParagraph(paragraphIndex);
-                if (pageIndex >= 0 && pageIndex !== currentReaderPageIndex) {
-                    currentReaderPageIndex = pageIndex;
-                    renderReaderPageContent();
-                    readerStage.scrollTop = 0;
-                }
-            }
+            ensureReaderPageVisibleForParagraph(paragraphIndex);
 
             hideReaderNotesPanel();
             requestAnimationFrame(() => {
@@ -7228,14 +7547,7 @@
                 .find(item => item.tokenIndex === String(tokenIndex));
             if (!occurrence) return;
 
-            if (readerSettings.flow === 'paged') {
-                const pageIndex = getReaderPageIndexForParagraph(occurrence.paragraphIndex);
-                if (pageIndex >= 0 && pageIndex !== currentReaderPageIndex) {
-                    currentReaderPageIndex = pageIndex;
-                    renderReaderPageContent();
-                    readerStage.scrollTop = 0;
-                }
-            }
+            ensureReaderPageVisibleForParagraph(occurrence.paragraphIndex);
 
             hideReaderBookErrataPanel();
             requestAnimationFrame(() => {
@@ -7469,8 +7781,10 @@
                 tokenIndexes.forEach(tokenIndex => highlightedOccurrences.add(tokenIndex));
                 currentReaderBook = {
                     ...currentReaderBook,
-                    highlightedOccurrences: Array.from(highlightedOccurrences)
+                    highlightedOccurrences: Array.from(highlightedOccurrences),
+                    updatedAt: Date.now()
                 };
+                currentReaderHighlightedSet = new Set(currentReaderBook.highlightedOccurrences || []);
                 const index = readerBooks.findIndex(book => book.id === currentReaderBook.id);
                 if (index > -1) readerBooks[index] = currentReaderBook;
                 await saveBook(currentReaderBook, { waitForCloud: true });
@@ -7527,6 +7841,7 @@
                     .filter(tokenIndex => !tokenIndexSet.has(tokenIndex)),
                 updatedAt: Date.now()
             };
+            currentReaderHighlightedSet = new Set(currentReaderBook.highlightedOccurrences || []);
             const index = readerBooks.findIndex(book => book.id === currentReaderBook.id);
             if (index > -1) readerBooks[index] = currentReaderBook;
             await saveBook(currentReaderBook, { waitForCloud: true });
@@ -7663,13 +7978,25 @@
             if (shouldOpen) updateReaderProgressDisplay();
             markStudyInteraction();
         });
-        readerBackHomeBtn.addEventListener('click', async () => {
-            await flushAllPendingSync('reader-back-home');
+        readerBackHomeBtn.addEventListener('click', () => {
+            saveCurrentReaderProgressLocal({ syncCloud: true, reason: 'reader-back-home' });
             showHomeView();
+            flushAllPendingSync('reader-back-home').catch(error => {
+                reportReaderProgressSaveError(error, 'cloud-flush');
+            });
         });
-        readerBookSelector.addEventListener('change', async () => {
-            await persistReaderProgress({ syncCloud: false, reason: 'reader-switch-book' });
-            await flushCloudSync('reader-switch-book');
+        readerBookSelector.addEventListener('change', () => {
+            const previousBook = currentReaderBook;
+            saveCurrentReaderProgressLocal({ syncCloud: true, reason: 'reader-switch-book' });
+            const bookToSave = previousBook && currentReaderBook?.id === previousBook.id ? currentReaderBook : previousBook;
+            if (bookToSave) {
+                saveBook(bookToSave, { syncCloud: false }).catch(error => {
+                    reportReaderProgressSaveError(error, 'indexeddb');
+                });
+            }
+            flushCloudSync('reader-switch-book').catch(error => {
+                reportReaderProgressSaveError(error, 'cloud-flush');
+            });
             const book = readerBooks.find(item => item.id === readerBookSelector.value);
             if (book) renderReaderBook(book);
             else renderReaderEmpty();
@@ -7753,6 +8080,7 @@
         });
         readerStage.addEventListener('scroll', () => {
             if (readerSettings.flow !== 'scroll') return;
+            handleReaderVirtualScroll();
             scheduleReaderProgressSave();
             markStudyInteraction();
         });
@@ -7813,13 +8141,13 @@
         });
         window.addEventListener('pagehide', () => {
             if (currentReaderBook) {
-                persistReaderProgress({ syncCloud: false, reason: 'pagehide' });
+                saveCurrentReaderProgressLocal({ syncCloud: false, reason: 'pagehide' });
             }
             flushCloudStateWithKeepalive('pagehide');
         });
         window.addEventListener('beforeunload', () => {
             if (currentReaderBook) {
-                persistReaderProgress({ syncCloud: false, reason: 'beforeunload' });
+                saveCurrentReaderProgressLocal({ syncCloud: false, reason: 'beforeunload' });
             }
             flushCloudStateWithKeepalive('beforeunload');
         });
