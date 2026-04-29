@@ -2338,6 +2338,12 @@
             background: rgba(255, 159, 10, 0.28);
             box-shadow: inset 0 -2px 0 rgba(255, 159, 10, 0.95);
         }
+        .reader-anchor-flash {
+            background: rgba(255, 159, 10, 0.14);
+            outline: 2px solid rgba(255, 159, 10, 0.45);
+            outline-offset: 4px;
+            border-radius: 6px;
+        }
         .reader-stage.reader-theme-dark .reader-note-highlight {
             text-decoration-color: #ff7a70;
         }
@@ -3517,8 +3523,10 @@
         let readerProgressThrottleTimer = null;
         let lastReaderProgressPersistAt = 0;
         let lastReaderBookProgressSaveAt = 0;
+        let lastReaderProgressTimestampMs = 0;
         let readerNoteFlashTimer = null;
         let readerErrataFlashTimer = null;
+        let readerAnchorFlashTimer = null;
         let homeCalendarCursor = new Date();
         let homeTrendRange = { preset: '7', start: null, end: null };
         let currentAppSection = 'home';
@@ -5871,12 +5879,17 @@
 
         function normalizeReaderProgress(raw) {
             if (!raw || typeof raw !== 'object') return null;
+            const updatedAt = raw.updatedAt || null;
+            const updatedAtMs = getTimestampMs(updatedAt);
+            if (updatedAtMs > lastReaderProgressTimestampMs) {
+                lastReaderProgressTimestampMs = updatedAtMs;
+            }
             return {
                 flow: raw.flow === 'paged' ? 'paged' : 'scroll',
                 scrollTop: Math.max(0, Math.round(Number(raw.scrollTop) || 0)),
                 pageIndex: Math.max(0, Math.round(Number(raw.pageIndex) || 0)),
                 percent: Math.min(100, Math.max(0, Math.round(Number(raw.percent) || 0))),
-                updatedAt: raw.updatedAt || null
+                updatedAt
             };
         }
 
@@ -6762,31 +6775,41 @@
         function scheduleReaderProgressSave() {
             updateReaderProgressDisplay();
             saveCurrentReaderProgressLocal({ syncCloud: true, reason: 'reader-progress' });
+            scheduleReaderBookProgressPersist('reader-progress');
+        }
+
+        function scheduleReaderBookProgressPersist(reason = 'reader-progress') {
             if (readerProgressSaveTimer) clearTimeout(readerProgressSaveTimer);
             readerProgressSaveTimer = setTimeout(() => {
-                persistReaderProgress({ syncCloud: false, reason: 'reader-progress-indexeddb' });
+                persistReaderProgress({ syncCloud: false, reason: `${reason}-indexeddb` });
             }, READER_PROGRESS_SAVE_DEBOUNCE_MS);
 
             const elapsed = Date.now() - lastReaderBookProgressSaveAt;
             if (elapsed >= READER_PROGRESS_SAVE_THROTTLE_MS) {
-                persistReaderProgress({ syncCloud: false, reason: 'reader-progress-throttle' });
+                persistReaderProgress({ syncCloud: false, reason: `${reason}-throttle` });
                 return;
             }
             if (!readerProgressThrottleTimer) {
                 readerProgressThrottleTimer = setTimeout(() => {
                     readerProgressThrottleTimer = null;
-                    persistReaderProgress({ syncCloud: false, reason: 'reader-progress-throttle' });
+                    persistReaderProgress({ syncCloud: false, reason: `${reason}-throttle` });
                 }, Math.max(250, READER_PROGRESS_SAVE_THROTTLE_MS - elapsed));
             }
         }
 
-        function captureReaderProgress(now = new Date().toISOString()) {
+        function getNextReaderProgressTimestamp() {
+            const nextMs = Math.max(Date.now(), lastReaderProgressTimestampMs + 1);
+            lastReaderProgressTimestampMs = nextMs;
+            return new Date(nextMs).toISOString();
+        }
+
+        function captureReaderProgress(now = null) {
             return {
                 flow: readerSettings.flow || 'scroll',
                 scrollTop: Math.max(0, Math.round(readerStage.scrollTop || 0)),
                 pageIndex: readerSettings.flow === 'paged' ? currentReaderPageIndex : currentReaderVirtualPageIndex,
                 percent: getReaderProgressPercent(),
-                updatedAt: now
+                updatedAt: now || getNextReaderProgressTimestamp()
             };
         }
 
@@ -6802,6 +6825,34 @@
             return progress;
         }
 
+        function clearReaderProgressTimers() {
+            if (readerProgressSaveTimer) {
+                clearTimeout(readerProgressSaveTimer);
+                readerProgressSaveTimer = null;
+            }
+            if (readerProgressThrottleTimer) {
+                clearTimeout(readerProgressThrottleTimer);
+                readerProgressThrottleTimer = null;
+            }
+        }
+
+        function commitReaderPositionChange(reason = 'reader-progress') {
+            updateReaderProgressDisplay();
+            const progress = saveCurrentReaderProgressLocal({ syncCloud: true, reason });
+            scheduleReaderBookProgressPersist(reason);
+            return progress;
+        }
+
+        function flushReaderProgressForLifecycle(reason = 'pagehide') {
+            if (!currentReaderBook) return false;
+            clearReaderProgressTimers();
+            saveCurrentReaderProgressLocal({ syncCloud: false, reason });
+            saveBook(currentReaderBook, { syncCloud: false }).catch(error => {
+                reportReaderProgressSaveError(error, 'indexeddb-lifecycle');
+            });
+            return true;
+        }
+
         function reportReaderProgressSaveError(error, phase = 'local') {
             console.error(`Reader progress ${phase} save failed:`, error);
             const message = `Reader progress save failed: ${error?.message || error}`;
@@ -6814,14 +6865,7 @@
         async function persistReaderProgress(options = {}) {
             const { syncCloud = true, flushCloud = false, reason = 'reader-progress' } = options;
             if (!currentReaderBook) return;
-            if (readerProgressSaveTimer) {
-                clearTimeout(readerProgressSaveTimer);
-                readerProgressSaveTimer = null;
-            }
-            if (readerProgressThrottleTimer) {
-                clearTimeout(readerProgressThrottleTimer);
-                readerProgressThrottleTimer = null;
-            }
+            clearReaderProgressTimers();
             try {
                 saveCurrentReaderProgressLocal({ syncCloud, reason });
                 await saveBook(currentReaderBook, { syncCloud: false });
@@ -6834,6 +6878,9 @@
 
         async function flushAllPendingSync(reason = 'flush', options = {}) {
             const { includeReaderBooks = false, keepalive = false } = options;
+            if (currentReaderBook) {
+                saveCurrentReaderProgressLocal({ syncCloud: false, reason });
+            }
             if (currentReaderBook) {
                 await persistReaderProgress({ syncCloud: false, reason });
             }
@@ -6857,7 +6904,7 @@
             hideReaderPopover();
             renderReaderPageContent();
             readerStage.scrollTop = 0;
-            persistReaderProgress();
+            commitReaderPositionChange('reader-page-change');
             markStudyInteraction();
         }
 
@@ -7479,7 +7526,7 @@
 
         function ensureReaderPageVisibleForParagraph(paragraphIndex) {
             const pageIndex = getReaderPageIndexForParagraph(paragraphIndex);
-            if (pageIndex < 0) return;
+            if (pageIndex < 0) return -1;
             if (readerSettings.flow === 'paged') {
                 if (pageIndex !== currentReaderPageIndex) {
                     currentReaderPageIndex = pageIndex;
@@ -7487,12 +7534,39 @@
                     renderReaderPageContent();
                     readerStage.scrollTop = 0;
                 }
-                return;
+                return pageIndex;
             }
 
             currentReaderVirtualPageIndex = pageIndex;
+            readerVirtualScrollApplying = true;
             renderReaderPageContent();
             readerStage.scrollTop = getReaderVirtualOffsetBeforePage(pageIndex);
+            requestAnimationFrame(() => {
+                readerVirtualScrollApplying = false;
+                updateReaderProgressDisplay();
+            });
+            return pageIndex;
+        }
+
+        function afterReaderTargetRendered(callback, attempts = 4) {
+            requestAnimationFrame(() => {
+                const done = Boolean(callback());
+                if (!done && attempts > 0) {
+                    afterReaderTargetRendered(callback, attempts - 1);
+                }
+            });
+        }
+
+        function flashReaderAnchorFallback(element) {
+            if (!element) return null;
+            if (readerAnchorFlashTimer) clearTimeout(readerAnchorFlashTimer);
+            readerContent.querySelectorAll('.reader-anchor-flash').forEach(item => item.classList.remove('reader-anchor-flash'));
+            element.classList.add('reader-anchor-flash');
+            readerAnchorFlashTimer = setTimeout(() => {
+                element.classList.remove('reader-anchor-flash');
+                readerAnchorFlashTimer = null;
+            }, 1800);
+            return element;
         }
 
         function jumpToReaderNote(noteId) {
@@ -7502,22 +7576,25 @@
             ensureReaderPageVisibleForParagraph(paragraphIndex);
 
             hideReaderNotesPanel();
-            requestAnimationFrame(() => {
-                const element = revealReaderNoteElement(note.id);
+            afterReaderTargetRendered(() => {
+                const element = revealReaderNoteElement(note.id, { behavior: 'auto' });
                 if (!element) {
                     const paragraph = readerContent.querySelector(`p[data-paragraph-index="${paragraphIndex}"]`);
-                    scrollReaderElementIntoView(paragraph);
+                    if (!paragraph) return false;
+                    scrollReaderElementIntoView(paragraph, { behavior: 'auto' });
+                    flashReaderAnchorFallback(paragraph);
                 }
                 showReaderNotePopover(note);
-                persistReaderProgress();
+                commitReaderPositionChange('reader-note-jump');
+                return true;
             });
             markStudyInteraction();
         }
 
-        function revealReaderNoteElement(noteId) {
+        function revealReaderNoteElement(noteId, options = {}) {
             const element = readerContent.querySelector(`[data-note-id="${escapeReaderCssValue(noteId)}"]`);
             if (!element) return null;
-            scrollReaderElementIntoView(element);
+            scrollReaderElementIntoView(element, options);
             if (readerNoteFlashTimer) clearTimeout(readerNoteFlashTimer);
             readerContent.querySelectorAll('.reader-note-flash').forEach(item => item.classList.remove('reader-note-flash'));
             element.classList.add('reader-note-flash');
@@ -7528,10 +7605,10 @@
             return element;
         }
 
-        function revealReaderErrataElement(tokenIndex) {
+        function revealReaderErrataElement(tokenIndex, options = {}) {
             const element = readerContent.querySelector(`.reader-word[data-token-index="${escapeReaderCssValue(tokenIndex)}"]`);
             if (!element) return null;
-            scrollReaderElementIntoView(element);
+            scrollReaderElementIntoView(element, options);
             if (readerErrataFlashTimer) clearTimeout(readerErrataFlashTimer);
             readerContent.querySelectorAll('.reader-word-flash').forEach(item => item.classList.remove('reader-word-flash'));
             element.classList.add('reader-word-flash');
@@ -7550,33 +7627,37 @@
             ensureReaderPageVisibleForParagraph(occurrence.paragraphIndex);
 
             hideReaderBookErrataPanel();
-            requestAnimationFrame(() => {
-                const element = revealReaderErrataElement(occurrence.tokenIndex);
+            afterReaderTargetRendered(() => {
+                const element = revealReaderErrataElement(occurrence.tokenIndex, { behavior: 'auto' });
                 if (element) {
                     showReaderPopover(createReaderSelectionFromWordElement(element));
                 } else {
                     const paragraph = readerContent.querySelector(`p[data-paragraph-index="${occurrence.paragraphIndex}"]`);
-                    scrollReaderElementIntoView(paragraph);
+                    if (!paragraph) return false;
+                    scrollReaderElementIntoView(paragraph, { behavior: 'auto' });
+                    flashReaderAnchorFallback(paragraph);
                 }
-                persistReaderProgress();
+                commitReaderPositionChange('reader-errata-jump');
+                return true;
             });
             markStudyInteraction();
         }
 
-        function scrollReaderElementIntoView(element) {
+        function scrollReaderElementIntoView(element, options = {}) {
             if (!element) return;
+            const behavior = options.behavior || 'smooth';
             if (readerSettings.flow === 'scroll') {
                 const stageRect = readerStage.getBoundingClientRect();
                 const elementRect = element.getBoundingClientRect();
                 const offset = elementRect.top - stageRect.top - (readerStage.clientHeight / 2) + (elementRect.height / 2);
                 readerStage.scrollTo({
                     top: Math.max(0, readerStage.scrollTop + offset),
-                    behavior: 'smooth'
+                    behavior
                 });
-                scheduleReaderProgressSave();
+                if (options.saveProgress !== false) scheduleReaderProgressSave();
                 return;
             }
-            element.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            element.scrollIntoView({ block: 'center', behavior });
         }
 
         function escapeReaderCssValue(value) {
@@ -8132,6 +8213,7 @@
         });
         document.addEventListener('visibilitychange', () => {
             if (document.hidden) {
+                flushReaderProgressForLifecycle('visibility-hidden');
                 flushAllPendingSync('visibility-hidden').catch(error => {
                     console.warn('Visibility flush failed:', error);
                 });
@@ -8140,15 +8222,11 @@
             }
         });
         window.addEventListener('pagehide', () => {
-            if (currentReaderBook) {
-                saveCurrentReaderProgressLocal({ syncCloud: false, reason: 'pagehide' });
-            }
+            flushReaderProgressForLifecycle('pagehide');
             flushCloudStateWithKeepalive('pagehide');
         });
         window.addEventListener('beforeunload', () => {
-            if (currentReaderBook) {
-                saveCurrentReaderProgressLocal({ syncCloud: false, reason: 'beforeunload' });
-            }
+            flushReaderProgressForLifecycle('beforeunload');
             flushCloudStateWithKeepalive('beforeunload');
         });
 
