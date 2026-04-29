@@ -3098,6 +3098,7 @@
         const LOCAL_STORAGE_KEY_DEFINITION_CACHE = 'kangkangWordPwa_definitionCache_v1';
         const LOCAL_STORAGE_KEY_READER_SETTINGS = 'kangkangWordPwa_readerSettings_v1';
         const LOCAL_STORAGE_KEY_READER_PROGRESS = 'kangkangWordPwa_readerProgress_v1';
+        const LOCAL_STORAGE_KEY_READER_DEBUG = 'kangkangWordPwa_readerDebug_v1';
         const LOCAL_STORAGE_KEY_ACTIVE_USER = 'kangkangWordPwa_activeUserId_v1';
         const LOCAL_STORAGE_KEY_CLOUD_CLIENT = 'kangkangWordPwa_cloudClientId_v1';
         const LOCAL_STORAGE_KEY_CLOUD_DIRTY = 'kangkangWordPwa_cloudDirty_v1';
@@ -3515,6 +3516,7 @@
         let currentReaderTokenCache = new Map();
         let currentReaderHighlightedSet = new Set();
         let readerLayoutCache = new Map();
+        let lastCloudReaderProgressStorage = { version: 1, books: {} };
         let readerVirtualPageHeights = [];
         let readerVirtualWindow = { startPage: 0, endPage: 0, topHeight: 0, bottomHeight: 0 };
         let readerVirtualScrollApplying = false;
@@ -3589,6 +3591,7 @@
             currentReaderTokenCache = new Map();
             currentReaderHighlightedSet = new Set();
             readerVirtualPageHeights = [];
+            lastCloudReaderProgressStorage = { version: 1, books: {} };
             readerVirtualWindow = { startPage: 0, endPage: 0, topHeight: 0, bottomHeight: 0 };
             readerVirtualScrollApplying = false;
         }
@@ -3707,6 +3710,17 @@
             if (!cloudSyncStatus) return;
             cloudSyncStatus.textContent = message;
             cloudSyncStatus.style.color = isError ? '#dc3545' : '#6c757d';
+        }
+
+        function isReaderDebugEnabled() {
+            return window.KANGKANG_READER_DEBUG === true
+                || localStorage.getItem(LOCAL_STORAGE_KEY_READER_DEBUG) === '1'
+                || localStorage.getItem(LOCAL_STORAGE_KEY_READER_DEBUG) === 'true';
+        }
+
+        function logReaderDebug(eventName, payload = {}) {
+            if (!isReaderDebugEnabled()) return;
+            console.debug(`[reader:${eventName}]`, payload);
         }
 
         function markCloudSyncDirty(reason = 'state-change') {
@@ -4005,15 +4019,21 @@
             keys.forEach(key => {
                 const localProgress = normalizeReaderProgress(localBooks[key]);
                 const cloudProgress = normalizeReaderProgress(cloudBooks[key]);
-                const chosen = chooseLatestReaderProgress(localProgress, cloudProgress);
-                if (chosen) {
-                    merged.books[key] = {
-                        ...chosen,
-                        bookId: localBooks[key]?.bookId || cloudBooks[key]?.bookId || '',
-                        bookKey: localBooks[key]?.bookKey || cloudBooks[key]?.bookKey || '',
-                        title: localBooks[key]?.title || cloudBooks[key]?.title || ''
-                    };
-                }
+                const validCandidates = [localProgress, cloudProgress].filter(isValidReaderProgress);
+                if (!validCandidates.length) return;
+                const chosen = validCandidates.sort((a, b) => getReaderProgressTime(b) - getReaderProgressTime(a))[0];
+                merged.books[key] = {
+                    ...chosen,
+                    bookId: localBooks[key]?.bookId || cloudBooks[key]?.bookId || '',
+                    bookKey: localBooks[key]?.bookKey || cloudBooks[key]?.bookKey || '',
+                    title: localBooks[key]?.title || cloudBooks[key]?.title || ''
+                };
+                logReaderDebug('progress-merge', {
+                    key,
+                    local: localProgress,
+                    cloud: cloudProgress,
+                    chosen
+                });
             });
             return merged;
         }
@@ -4034,15 +4054,44 @@
         }
 
         function mergeReaderBookRecords(localBook, cloudBook) {
-            if (!localBook) return normalizeCloudReaderBooks([cloudBook])[0] || null;
-            if (!cloudBook) return normalizeCloudReaderBooks([localBook])[0] || null;
+            if (!localBook || !cloudBook) {
+                const single = normalizeCloudReaderBooks([localBook || cloudBook])[0] || null;
+                if (!single) return null;
+                const localStorageProgress = getStoredReaderProgress(single);
+                const cloudSnapshotProgress = getReaderProgressFromStorageForBook(lastCloudReaderProgressStorage, single, 'cloudSnapshot');
+                single.progress = chooseLatestReaderProgress(localStorageProgress, single.progress, cloudSnapshotProgress);
+                logReaderDebug('reader-book-progress-merge', {
+                    bookId: single.id || '',
+                    localStorage: localStorageProgress,
+                    book: normalizeReaderProgress((localBook || cloudBook)?.progress),
+                    cloudSnapshot: cloudSnapshotProgress,
+                    chosen: single.progress
+                });
+                return single;
+            }
             const preferLocal = getReaderBookUpdatedMs(localBook) >= getReaderBookUpdatedMs(cloudBook);
             const preferred = preferLocal ? localBook : cloudBook;
             const fallback = preferLocal ? cloudBook : localBook;
+            const localStorageProgress = getStoredReaderProgress(localBook || cloudBook);
+            const cloudSnapshotProgress = getReaderProgressFromStorageForBook(lastCloudReaderProgressStorage, localBook || cloudBook, 'cloudSnapshot');
+            const progress = chooseLatestReaderProgress(
+                localStorageProgress,
+                localBook.progress,
+                cloudBook.progress,
+                cloudSnapshotProgress
+            );
+            logReaderDebug('reader-book-progress-merge', {
+                bookId: localBook?.id || cloudBook?.id || '',
+                localStorage: localStorageProgress,
+                localBook: normalizeReaderProgress(localBook.progress),
+                cloudBook: normalizeReaderProgress(cloudBook.progress),
+                cloudSnapshot: cloudSnapshotProgress,
+                chosen: progress
+            });
             const merged = {
                 ...fallback,
                 ...preferred,
-                progress: chooseLatestReaderProgress(localBook.progress, cloudBook.progress),
+                progress,
                 highlightedOccurrences: uniqueStrings([
                     ...(cloudBook.highlightedOccurrences || []),
                     ...(localBook.highlightedOccurrences || [])
@@ -4133,6 +4182,7 @@
         async function hydrateLocalFromCloudData(data = {}, readerBookList = null) {
             cloudHydrating = true;
             try {
+                lastCloudReaderProgressStorage = data.readerProgressStorage || { version: 1, books: {} };
                 const localAppState = readLocalAppStatePayload();
                 const mergedAppState = mergeAppStatePayload(localAppState, data.appState || {});
                 const mergedProgressStorage = mergeReaderProgressStorage(
@@ -4208,11 +4258,14 @@
         }
 
         function clearLocalProfileCache() {
+            const readerProgressBackup = localStorage.getItem(LOCAL_STORAGE_KEY_READER_PROGRESS);
             localStorage.removeItem(LOCAL_STORAGE_KEY_APP_STATE);
             localStorage.removeItem(LOCAL_STORAGE_KEY_AI_CONFIG);
             localStorage.removeItem(LOCAL_STORAGE_KEY_READER_SETTINGS);
-            localStorage.removeItem(LOCAL_STORAGE_KEY_READER_PROGRESS);
             resetState();
+            if (readerProgressBackup) {
+                localStorage.setItem(LOCAL_STORAGE_KEY_READER_PROGRESS, readerProgressBackup);
+            }
         }
 
         function subscribeToCloudStateChanges() {
@@ -5893,6 +5946,20 @@
             };
         }
 
+        function isValidReaderProgress(progress) {
+            if (!progress || typeof progress !== 'object') return false;
+            const pageIndex = Number(progress.pageIndex);
+            const percent = Number(progress.percent);
+            const scrollTop = Number(progress.scrollTop);
+            return Number.isFinite(pageIndex)
+                && pageIndex >= 0
+                && Number.isFinite(percent)
+                && percent >= 0
+                && percent <= 100
+                && Number.isFinite(scrollTop)
+                && scrollTop >= 0;
+        }
+
         function getReaderProgressTime(progress) {
             if (!progress?.updatedAt) return 0;
             const time = new Date(progress.updatedAt).getTime();
@@ -5900,26 +5967,56 @@
         }
 
         function chooseLatestReaderProgress(...progresses) {
-            return progresses
-                .map(normalizeReaderProgress)
+            const candidates = progresses
+                .map(progress => {
+                    const normalized = normalizeReaderProgress(progress);
+                    if (!normalized || !isValidReaderProgress(normalized)) return null;
+                    return normalized;
+                })
                 .filter(Boolean)
-                .sort((a, b) => getReaderProgressTime(b) - getReaderProgressTime(a))[0] || createReaderProgress();
+                .sort((a, b) => getReaderProgressTime(b) - getReaderProgressTime(a));
+            return candidates[0] || createReaderProgress();
+        }
+
+        function getReaderProgressCandidatesFromStorage(storage, book, source = 'storage') {
+            const books = storage?.books || {};
+            return getReaderBookKeys(book)
+                .map(key => ({
+                    key,
+                    source,
+                    progress: normalizeReaderProgress(books[key])
+                }))
+                .filter(item => item.progress && isValidReaderProgress(item.progress));
+        }
+
+        function getReaderProgressFromStorageForBook(storage, book, source = 'storage') {
+            return getReaderProgressCandidatesFromStorage(storage, book, source)
+                .sort((a, b) => getReaderProgressTime(b.progress) - getReaderProgressTime(a.progress))[0]?.progress || null;
         }
 
         function getStoredReaderProgress(book) {
             const storage = loadReaderProgressStorage();
             const idProgress = book?.id ? normalizeReaderProgress(storage.books[`id:${book.id}`]) : null;
-            if (idProgress) return idProgress;
+            if (idProgress && isValidReaderProgress(idProgress)) return idProgress;
 
-            return getReaderBookKeys(book)
-                .filter(key => !key.startsWith('id:'))
-                .map(key => normalizeReaderProgress(storage.books[key]))
-                .filter(Boolean)
-                .sort((a, b) => getReaderProgressTime(b) - getReaderProgressTime(a))[0] || null;
+            return getReaderProgressCandidatesFromStorage(storage, book, 'localStorage')
+                .filter(item => !item.key.startsWith('id:'))
+                .sort((a, b) => getReaderProgressTime(b.progress) - getReaderProgressTime(a.progress))[0]?.progress || null;
         }
 
         function getReaderProgressForBook(book) {
-            return chooseLatestReaderProgress(book?.progress, getStoredReaderProgress(book));
+            const localStorageProgress = getStoredReaderProgress(book);
+            const indexedDbProgress = normalizeReaderProgress(book?.progress);
+            const cloudProgress = getReaderProgressFromStorageForBook(lastCloudReaderProgressStorage, book, 'cloudSnapshot');
+            const chosen = chooseLatestReaderProgress(localStorageProgress, indexedDbProgress, cloudProgress);
+            logReaderDebug('restore-candidates', {
+                bookId: book?.id || '',
+                localStorage: localStorageProgress,
+                indexedDb: indexedDbProgress,
+                cloudSnapshot: cloudProgress,
+                chosen
+            });
+            return chosen;
         }
 
         function saveReaderProgressLocally(book, progress, options = {}) {
@@ -5927,7 +6024,8 @@
             if (!book || !normalizedProgress) return;
 
             const storage = loadReaderProgressStorage();
-            getReaderBookKeys(book).forEach(key => {
+            const keys = getReaderBookKeys(book);
+            keys.forEach(key => {
                 storage.books[key] = {
                     ...normalizedProgress,
                     bookId: book.id || '',
@@ -5936,6 +6034,13 @@
                 };
             });
             saveReaderProgressStorage(storage, options);
+            logReaderDebug('progress-save-local', {
+                reason: options.reason || 'reader-progress',
+                pageIndex: normalizedProgress.pageIndex,
+                percent: normalizedProgress.percent,
+                updatedAt: normalizedProgress.updatedAt,
+                keys
+            });
         }
 
         function removeReaderProgressLocally(book, options = {}) {
@@ -7292,7 +7397,21 @@
                     if (!position) return null;
                     const paragraphText = getReaderParagraphText(position.paragraphIndex);
                     const token = getReaderTokensForParagraph(position.paragraphIndex, paragraphText)[position.wordIndex];
-                    if (!token) return null;
+                    if (!token) {
+                        return {
+                            tokenIndex,
+                            paragraphIndex: position.paragraphIndex,
+                            wordIndex: position.wordIndex,
+                            word: '错词',
+                            normalized: '',
+                            startOffset: 0,
+                            endOffset: 0,
+                            snippet: paragraphText
+                                ? buildReaderErrataSnippet(paragraphText, 0, Math.min(36, paragraphText.length))
+                                : `第 ${position.paragraphIndex + 1} 段`,
+                            invalidToken: true
+                        };
+                    }
                     return {
                         tokenIndex,
                         paragraphIndex: position.paragraphIndex,
@@ -7526,6 +7645,7 @@
 
         function ensureReaderPageVisibleForParagraph(paragraphIndex) {
             const pageIndex = getReaderPageIndexForParagraph(paragraphIndex);
+            logReaderDebug('jump-load-page', { paragraphIndex, pageIndex, flow: readerSettings.flow });
             if (pageIndex < 0) return -1;
             if (readerSettings.flow === 'paged') {
                 if (pageIndex !== currentReaderPageIndex) {
@@ -7548,12 +7668,38 @@
             return pageIndex;
         }
 
-        function afterReaderTargetRendered(callback, attempts = 4) {
-            requestAnimationFrame(() => {
-                const done = Boolean(callback());
-                if (!done && attempts > 0) {
-                    afterReaderTargetRendered(callback, attempts - 1);
-                }
+        function waitForReaderRenderedTarget(resolveTarget, timeoutMs = 2200) {
+            return new Promise(resolve => {
+                let finished = false;
+                let observer = null;
+                let frameId = 0;
+                const startedAt = Date.now();
+
+                const finish = target => {
+                    if (finished) return;
+                    finished = true;
+                    if (observer) observer.disconnect();
+                    if (frameId) cancelAnimationFrame(frameId);
+                    resolve(target || null);
+                };
+
+                const check = () => {
+                    if (finished) return;
+                    const target = resolveTarget();
+                    if (target) {
+                        finish(target);
+                        return;
+                    }
+                    if (Date.now() - startedAt >= timeoutMs) {
+                        finish(null);
+                        return;
+                    }
+                    frameId = requestAnimationFrame(check);
+                };
+
+                observer = new MutationObserver(check);
+                observer.observe(readerContent, { childList: true, subtree: true });
+                check();
             });
         }
 
@@ -7569,25 +7715,62 @@
             return element;
         }
 
-        function jumpToReaderNote(noteId) {
+        function findReaderNoteFallbackParagraphIndex(note) {
+            const anchor = note?.anchor || {};
+            const preferredIndex = Math.max(0, Math.round(Number(anchor.paragraphIndex) || 0));
+            const selectedText = normalizeReaderAnchorText(note?.selectedText || '');
+            const context = normalizeReaderAnchorText(note?.context || '');
+            const beforeContext = normalizeReaderAnchorText(note?.beforeContext || '');
+            const afterContext = normalizeReaderAnchorText(note?.afterContext || '');
+            const start = Math.max(0, preferredIndex - 4);
+            const end = Math.min(currentReaderParagraphs.length - 1, preferredIndex + 4);
+            const scoreParagraph = index => {
+                const text = normalizeReaderAnchorText(getReaderParagraphText(index));
+                if (!text) return -1;
+                let score = index === preferredIndex ? 1 : 0;
+                if (selectedText && text.includes(selectedText)) score += 100;
+                if (context && (text.includes(context) || context.includes(text.slice(0, Math.min(120, text.length))))) score += 30;
+                if (beforeContext && text.includes(beforeContext.slice(-40))) score += 15;
+                if (afterContext && text.includes(afterContext.slice(0, 40))) score += 15;
+                return score;
+            };
+
+            let best = { index: preferredIndex, score: scoreParagraph(preferredIndex) };
+            for (let index = start; index <= end; index += 1) {
+                const score = scoreParagraph(index);
+                if (score > best.score) best = { index, score };
+            }
+            return best.score > 0 ? best.index : preferredIndex;
+        }
+
+        async function jumpToReaderNote(noteId) {
             const note = getReaderNoteById(noteId);
             if (!note) return;
-            const paragraphIndex = Number(note.anchor?.paragraphIndex);
-            ensureReaderPageVisibleForParagraph(paragraphIndex);
+            const paragraphIndex = findReaderNoteFallbackParagraphIndex(note);
+            const pageIndex = ensureReaderPageVisibleForParagraph(paragraphIndex);
 
             hideReaderNotesPanel();
-            afterReaderTargetRendered(() => {
-                const element = revealReaderNoteElement(note.id, { behavior: 'auto' });
-                if (!element) {
-                    const paragraph = readerContent.querySelector(`p[data-paragraph-index="${paragraphIndex}"]`);
-                    if (!paragraph) return false;
-                    scrollReaderElementIntoView(paragraph, { behavior: 'auto' });
-                    flashReaderAnchorFallback(paragraph);
-                }
-                showReaderNotePopover(note);
-                commitReaderPositionChange('reader-note-jump');
-                return true;
+            const element = await waitForReaderRenderedTarget(() => {
+                return readerContent.querySelector(`[data-note-id="${escapeReaderCssValue(note.id)}"]`)
+                    || readerContent.querySelector(`p[data-paragraph-index="${paragraphIndex}"]`);
             });
+            const exactElement = element?.matches?.(`[data-note-id="${escapeReaderCssValue(note.id)}"]`) ? element : null;
+            const paragraph = exactElement ? exactElement : readerContent.querySelector(`p[data-paragraph-index="${paragraphIndex}"]`);
+            if (exactElement) {
+                revealReaderNoteElement(note.id, { behavior: 'auto' });
+            } else if (paragraph) {
+                scrollReaderElementIntoView(paragraph, { behavior: 'auto' });
+                flashReaderAnchorFallback(paragraph);
+            }
+            logReaderDebug('note-jump', {
+                noteId,
+                paragraphIndex,
+                pageIndex,
+                foundDom: Boolean(exactElement),
+                fallback: !exactElement
+            });
+            showReaderNotePopover(note);
+            commitReaderPositionChange('reader-note-jump');
             markStudyInteraction();
         }
 
@@ -7619,27 +7802,83 @@
             return element;
         }
 
-        function jumpToReaderErrataOccurrence(tokenIndex) {
+        function findReaderErrataFallbackOccurrence(tokenIndex, fallbackWord = '') {
+            const parsed = parseReaderTokenIndex(tokenIndex);
             const occurrence = getCurrentReaderBookErrataOccurrences()
                 .find(item => item.tokenIndex === String(tokenIndex));
+            if (occurrence) return occurrence;
+            if (!parsed) return null;
+
+            const normalizedWord = normalizeReaderWord(fallbackWord);
+            const start = Math.max(0, parsed.paragraphIndex - 3);
+            const end = Math.min(currentReaderParagraphs.length - 1, parsed.paragraphIndex + 3);
+            for (let paragraphIndex = start; paragraphIndex <= end; paragraphIndex += 1) {
+                const paragraphText = getReaderParagraphText(paragraphIndex);
+                const tokens = getReaderTokensForParagraph(paragraphIndex, paragraphText);
+                const token = normalizedWord
+                    ? tokens.find(item => item.normalized === normalizedWord)
+                    : tokens[parsed.wordIndex];
+                if (!token) continue;
+                return {
+                    tokenIndex: `${paragraphIndex}:${token.wordIndex}`,
+                    originalTokenIndex: String(tokenIndex),
+                    paragraphIndex,
+                    wordIndex: token.wordIndex,
+                    word: token.text,
+                    normalized: token.normalized,
+                    startOffset: token.start,
+                    endOffset: token.end,
+                    snippet: buildReaderErrataSnippet(paragraphText, token.start, token.end),
+                    relocated: true
+                };
+            }
+
+            return {
+                tokenIndex: String(tokenIndex),
+                paragraphIndex: parsed.paragraphIndex,
+                wordIndex: parsed.wordIndex,
+                word: fallbackWord || '错词',
+                normalized: normalizedWord,
+                startOffset: 0,
+                endOffset: 0,
+                snippet: getReaderParagraphText(parsed.paragraphIndex),
+                invalidToken: true
+            };
+        }
+
+        async function jumpToReaderErrataOccurrence(tokenIndex, fallbackWord = '') {
+            const occurrence = findReaderErrataFallbackOccurrence(tokenIndex, fallbackWord);
             if (!occurrence) return;
 
             ensureReaderPageVisibleForParagraph(occurrence.paragraphIndex);
 
             hideReaderBookErrataPanel();
-            afterReaderTargetRendered(() => {
-                const element = revealReaderErrataElement(occurrence.tokenIndex, { behavior: 'auto' });
-                if (element) {
-                    showReaderPopover(createReaderSelectionFromWordElement(element));
-                } else {
-                    const paragraph = readerContent.querySelector(`p[data-paragraph-index="${occurrence.paragraphIndex}"]`);
-                    if (!paragraph) return false;
+            const element = await waitForReaderRenderedTarget(() => {
+                return readerContent.querySelector(`.reader-word[data-token-index="${escapeReaderCssValue(occurrence.tokenIndex)}"]`)
+                    || readerContent.querySelector(`p[data-paragraph-index="${occurrence.paragraphIndex}"]`);
+            });
+            const exactElement = element?.matches?.('.reader-word') ? element : null;
+            if (exactElement) {
+                revealReaderErrataElement(occurrence.tokenIndex, { behavior: 'auto' });
+                showReaderPopover(createReaderSelectionFromWordElement(exactElement));
+            } else {
+                const paragraph = readerContent.querySelector(`p[data-paragraph-index="${occurrence.paragraphIndex}"]`);
+                if (paragraph) {
                     scrollReaderElementIntoView(paragraph, { behavior: 'auto' });
                     flashReaderAnchorFallback(paragraph);
                 }
-                commitReaderPositionChange('reader-errata-jump');
-                return true;
+            }
+            logReaderDebug('errata-jump', {
+                tokenIndex,
+                resolvedTokenIndex: occurrence.tokenIndex,
+                paragraphIndex: occurrence.paragraphIndex,
+                pageIndex: getReaderPageIndexForParagraph(occurrence.paragraphIndex),
+                foundDom: Boolean(exactElement),
+                fallback: !exactElement,
+                relocated: Boolean(occurrence.relocated),
+                invalidToken: Boolean(occurrence.invalidToken)
             });
+            commitReaderPositionChange('reader-errata-jump');
             markStudyInteraction();
         }
 
@@ -8112,7 +8351,7 @@
             }
             const item = closestFromEventTarget(event.target, '.reader-errata-item');
             if (!item) return;
-            jumpToReaderErrataOccurrence(item.dataset.tokenIndex);
+            jumpToReaderErrataOccurrence(item.dataset.tokenIndex, item.dataset.word || '');
         });
         readerDeleteBookBtn.addEventListener('click', async () => {
             if (!currentReaderBook) return;
