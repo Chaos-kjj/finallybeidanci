@@ -1,4 +1,4 @@
-const CACHE_NAME = 'kangkang-word-pwa-v12';
+const CACHE_NAME = 'kangkang-word-pwa-v8';
 const APP_SHELL = [
   './',
   './index.html',
