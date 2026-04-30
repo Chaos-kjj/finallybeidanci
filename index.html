@@ -1925,6 +1925,33 @@
             background: linear-gradient(90deg, rgba(52, 199, 89, 0.95), rgba(10, 132, 255, 0.95));
             transition: width 0.2s ease;
         }
+        .reader-progress-debug {
+            display: grid;
+            grid-template-columns: repeat(5, minmax(0, 1fr));
+            gap: 0.45rem;
+            margin-top: 0.7rem;
+            color: var(--muted);
+            font-size: 0.74rem;
+            line-height: 1.35;
+        }
+        .reader-progress-debug span {
+            min-width: 0;
+            padding: 0.35rem 0.45rem;
+            border-radius: 8px;
+            background: rgba(15, 23, 42, 0.045);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .reader-progress-debug b {
+            color: var(--text);
+            font-weight: 700;
+        }
+        @media (max-width: 720px) {
+            .reader-progress-debug {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+        }
         .reader-page-controls {
             display: flex;
             align-items: center;
@@ -3307,6 +3334,13 @@
                     <div class="reader-progress-track">
                         <div id="reader-progress-fill" class="reader-progress-fill"></div>
                     </div>
+                    <div id="reader-progress-debug-panel" class="reader-progress-debug" aria-label="reader progress debug">
+                        <span>当前页 <b id="reader-debug-current">--</b></span>
+                        <span>已保存 <b id="reader-debug-saved">--</b></span>
+                        <span>本地读取 <b id="reader-debug-local">--</b></span>
+                        <span>云端读取 <b id="reader-debug-cloud">--</b></span>
+                        <span>最终恢复 <b id="reader-debug-final">--</b></span>
+                    </div>
                     <div id="reader-page-controls" class="reader-page-controls hidden">
                         <button id="reader-prev-page" class="reader-secondary-btn" type="button" aria-label="上一页">‹</button>
                         <span id="reader-page-label">第 1 / 1 页</span>
@@ -3516,7 +3550,7 @@
         let currentReaderTokenCache = new Map();
         let currentReaderHighlightedSet = new Set();
         let readerLayoutCache = new Map();
-        let lastCloudReaderProgressStorage = { version: 1, books: {} };
+        let lastCloudReaderProgressStorage = { version: 2, books: {}, stableBooks: {} };
         let readerVirtualPageHeights = [];
         let readerVirtualWindow = { startPage: 0, endPage: 0, topHeight: 0, bottomHeight: 0 };
         let readerVirtualScrollApplying = false;
@@ -3591,7 +3625,7 @@
             currentReaderTokenCache = new Map();
             currentReaderHighlightedSet = new Set();
             readerVirtualPageHeights = [];
-            lastCloudReaderProgressStorage = { version: 1, books: {} };
+            lastCloudReaderProgressStorage = { version: 2, books: {}, stableBooks: {} };
             readerVirtualWindow = { startPage: 0, endPage: 0, topHeight: 0, bottomHeight: 0 };
             readerVirtualScrollApplying = false;
         }
@@ -3722,6 +3756,295 @@
             if (!isReaderDebugEnabled()) return;
             console.debug(`[reader:${eventName}]`, payload);
         }
+
+        const progressManager = (() => {
+            const debugState = {
+                current: null,
+                saved: null,
+                local: null,
+                cloud: null,
+                final: null
+            };
+
+            function normalizeStorageShape(raw = {}) {
+                const source = raw && typeof raw === 'object' ? raw : {};
+                const books = source.books && typeof source.books === 'object' ? { ...source.books } : {};
+                const stableBooks = source.stableBooks && typeof source.stableBooks === 'object' ? { ...source.stableBooks } : {};
+                Object.keys(books).forEach(key => {
+                    if ((key.startsWith('hash:') || key.startsWith('content:') || key.startsWith('meta:')) && !stableBooks[key]) {
+                        stableBooks[key] = books[key];
+                    }
+                });
+                return { version: 2, books, stableBooks };
+            }
+
+            function loadStorage() {
+                try {
+                    return normalizeStorageShape(JSON.parse(localStorage.getItem(LOCAL_STORAGE_KEY_READER_PROGRESS) || '{}'));
+                } catch (error) {
+                    reportReaderProgressSaveError(error, 'local-read');
+                    return normalizeStorageShape();
+                }
+            }
+
+            function saveStorage(storage, options = {}) {
+                const { syncCloud = true, reason = 'reader-progress-storage' } = options;
+                try {
+                    const normalizedStorage = normalizeStorageShape(storage);
+                    localStorage.setItem(LOCAL_STORAGE_KEY_READER_PROGRESS, JSON.stringify(normalizedStorage));
+                    if (syncCloud) scheduleCloudSync(reason);
+                    return true;
+                } catch (error) {
+                    reportReaderProgressSaveError(error, 'local');
+                    return false;
+                }
+            }
+
+            function getStableBookKey(book) {
+                if (!book) return '';
+                if (book.fileHash) return `hash:${book.fileHash}`;
+                if (book.contentHash) return `content:${book.contentHash}`;
+                const existingKey = String(book.bookKey || '');
+                if (existingKey.startsWith('hash:') || existingKey.startsWith('content:')) return existingKey;
+                const generatedContentKey = getGeneratedContentBookKey(book);
+                if (generatedContentKey) return generatedContentKey;
+                return getReaderBookFallbackKey(book);
+            }
+
+            function getGeneratedContentBookKey(book) {
+                const text = String(book?.text || '');
+                if (!text) return '';
+                return `content:${hashReaderString(`${text.length}:${text.slice(0, 1000)}:${text.slice(-1000)}`)}`;
+            }
+
+            function getBookKeys(book) {
+                if (!book) return [];
+                const keys = [];
+                const stableKey = getStableBookKey(book);
+                if (stableKey) keys.push(stableKey);
+                if (book.bookKey) keys.push(String(book.bookKey));
+                if (book.fileHash) keys.push(`hash:${book.fileHash}`);
+                if (book.contentHash) keys.push(`content:${book.contentHash}`);
+                const generatedContentKey = getGeneratedContentBookKey(book);
+                if (generatedContentKey) keys.push(generatedContentKey);
+                const fallbackKey = getReaderBookFallbackKey(book);
+                if (fallbackKey) keys.push(fallbackKey);
+                if (book.id) keys.push(`id:${book.id}`);
+                return [...new Set(keys.filter(Boolean))];
+            }
+
+            function makeProgressRecord(book, progress) {
+                const stableBookKey = getStableBookKey(book);
+                const seed = {
+                    ...(progress || {}),
+                    updatedAt: progress?.updatedAt || getNextReaderProgressTimestamp()
+                };
+                const normalized = normalizeReaderProgress(seed) || createReaderProgress();
+                if (!normalized.updatedAt) normalized.updatedAt = getNextReaderProgressTimestamp();
+                if (!Number.isFinite(Number(normalized.virtualPageIndex))) {
+                    normalized.virtualPageIndex = Math.max(0, Math.round(Number(seed.virtualPageIndex ?? seed.pageIndex) || 0));
+                }
+                return {
+                    ...normalized,
+                    bookId: book?.id || '',
+                    bookKey: stableBookKey || book?.bookKey || '',
+                    title: book?.title || ''
+                };
+            }
+
+            function getCandidatesFromStorage(storage, book, source = 'storage') {
+                const normalizedStorage = normalizeStorageShape(storage);
+                const stableKey = getStableBookKey(book);
+                const candidates = [];
+                if (stableKey && normalizedStorage.stableBooks[stableKey]) {
+                    candidates.push({
+                        key: stableKey,
+                        source: `${source}:stable`,
+                        progress: normalizeReaderProgress(normalizedStorage.stableBooks[stableKey])
+                    });
+                }
+                getBookKeys(book).forEach(key => {
+                    if (!normalizedStorage.books[key]) return;
+                    candidates.push({
+                        key,
+                        source,
+                        progress: normalizeReaderProgress(normalizedStorage.books[key])
+                    });
+                });
+                return candidates
+                    .filter(item => item.progress && isValidReaderProgress(item.progress))
+                    .sort((a, b) => getReaderProgressTime(b.progress) - getReaderProgressTime(a.progress));
+            }
+
+            function readLocalDetails(book) {
+                const candidates = getCandidatesFromStorage(loadStorage(), book, 'localStorage');
+                const chosen = candidates[0] || null;
+                return {
+                    key: chosen?.key || '',
+                    progress: chosen?.progress || null,
+                    candidates
+                };
+            }
+
+            function readLocal(book) {
+                return readLocalDetails(book).progress;
+            }
+
+            function readCloudDetails(book) {
+                const candidates = getCandidatesFromStorage(lastCloudReaderProgressStorage, book, 'cloudSnapshot');
+                const chosen = candidates[0] || null;
+                return {
+                    key: chosen?.key || '',
+                    progress: chosen?.progress || null,
+                    candidates
+                };
+            }
+
+            function readCloud(book) {
+                return readCloudDetails(book).progress;
+            }
+
+            function chooseRestoreProgress(book, indexedDbProgress = null) {
+                const local = readLocalDetails(book);
+                const cloud = readCloudDetails(book);
+                const indexedDb = normalizeReaderProgress(indexedDbProgress);
+                const indexedDbValid = indexedDb && isValidReaderProgress(indexedDb) ? indexedDb : null;
+                const nonLocalCandidates = [indexedDbValid, cloud.progress]
+                    .filter(progress => progress && isValidReaderProgress(progress))
+                    .sort((a, b) => getReaderProgressTime(b) - getReaderProgressTime(a));
+                const finalProgress = local.progress || nonLocalCandidates[0] || createReaderProgress();
+                debugState.local = local.progress;
+                debugState.cloud = cloud.progress;
+                debugState.final = finalProgress;
+                if (local.progress) debugState.saved = local.progress;
+                updateDebugPanel();
+                logReaderDebug('progress-restore', {
+                    bookId: book?.id || '',
+                    stableBookKey: getStableBookKey(book),
+                    local: local.progress,
+                    localKey: local.key,
+                    indexedDb,
+                    cloud: cloud.progress,
+                    cloudKey: cloud.key,
+                    final: finalProgress,
+                    source: local.progress ? 'localStorage' : (finalProgress === cloud.progress ? 'cloud' : (indexedDbValid ? 'indexedDb' : 'default'))
+                });
+                return finalProgress;
+            }
+
+            function commitProgressImmediate(book, progress, reason = 'reader-progress') {
+                if (!book) return null;
+                const record = makeProgressRecord(book, progress);
+                if (!isValidReaderProgress(record)) return null;
+                const storage = loadStorage();
+                const stableBookKey = getStableBookKey(book);
+                const keys = getBookKeys(book);
+                keys.forEach(key => {
+                    storage.books[key] = { ...record, aliasKey: key };
+                });
+                if (stableBookKey) {
+                    storage.stableBooks[stableBookKey] = { ...record, aliasKey: stableBookKey };
+                }
+                const saved = saveStorage(storage, { syncCloud: false, reason });
+                if (!saved) return null;
+                debugState.saved = record;
+                debugState.local = record;
+                debugState.final = record;
+                updateDebugPanel();
+                logReaderDebug('progress-commit', {
+                    reason,
+                    pageIndex: record.pageIndex,
+                    virtualPageIndex: record.virtualPageIndex,
+                    percent: record.percent,
+                    updatedAt: record.updatedAt,
+                    stableBookKey,
+                    keys
+                });
+                scheduleCloudSync(reason);
+                return record;
+            }
+
+            function mergeStorage(localStorageValue = {}, cloudStorageValue = {}) {
+                const localStorageShape = normalizeStorageShape(localStorageValue);
+                const cloudStorageShape = normalizeStorageShape(cloudStorageValue);
+                const merged = normalizeStorageShape();
+                const keySources = [
+                    [localStorageShape.books, cloudStorageShape.books, merged.books],
+                    [localStorageShape.stableBooks, cloudStorageShape.stableBooks, merged.stableBooks]
+                ];
+                keySources.forEach(([localBooks, cloudBooks, target]) => {
+                    const keys = new Set([...Object.keys(cloudBooks || {}), ...Object.keys(localBooks || {})]);
+                    keys.forEach(key => {
+                        const localProgress = normalizeReaderProgress(localBooks[key]);
+                        const cloudProgress = normalizeReaderProgress(cloudBooks[key]);
+                        const chosen = localProgress && isValidReaderProgress(localProgress)
+                            ? { ...localBooks[key], ...localProgress }
+                            : (cloudProgress && isValidReaderProgress(cloudProgress) ? { ...cloudBooks[key], ...cloudProgress } : null);
+                        if (!chosen) return;
+                        target[key] = chosen;
+                        logReaderDebug('progress-merge', {
+                            key,
+                            local: localProgress,
+                            cloud: cloudProgress,
+                            chosen,
+                            source: localProgress && isValidReaderProgress(localProgress) ? 'local' : 'cloud'
+                        });
+                    });
+                });
+                return merged;
+            }
+
+            function formatPage(progress) {
+                if (!progress || !isValidReaderProgress(progress)) return '--';
+                const pageNumber = Math.max(1, Math.round(Number(progress.pageIndex) || 0) + 1);
+                const percent = Number.isFinite(Number(progress.percent)) ? `${Math.round(Number(progress.percent))}%` : '--';
+                return `${pageNumber} / ${percent}`;
+            }
+
+            function updateCurrentDebugProgress() {
+                if (!currentReaderBook) {
+                    debugState.current = null;
+                    return;
+                }
+                debugState.current = {
+                    pageIndex: readerSettings.flow === 'paged' ? currentReaderPageIndex : currentReaderVirtualPageIndex,
+                    virtualPageIndex: currentReaderVirtualPageIndex,
+                    scrollTop: Math.max(0, Math.round(readerStage?.scrollTop || 0)),
+                    percent: getReaderProgressPercent(),
+                    updatedAt: currentReaderBook.progress?.updatedAt || null
+                };
+            }
+
+            function updateDebugPanel() {
+                updateCurrentDebugProgress();
+                const fields = {
+                    'reader-debug-current': debugState.current,
+                    'reader-debug-saved': debugState.saved,
+                    'reader-debug-local': debugState.local,
+                    'reader-debug-cloud': debugState.cloud,
+                    'reader-debug-final': debugState.final
+                };
+                Object.entries(fields).forEach(([id, progress]) => {
+                    const element = document.getElementById(id);
+                    if (element) element.textContent = formatPage(progress);
+                });
+            }
+
+            return {
+                getStableBookKey,
+                getBookKeys,
+                loadStorage,
+                saveStorage,
+                readLocal,
+                readLocalDetails,
+                readCloud,
+                readCloudDetails,
+                chooseRestoreProgress,
+                commitProgressImmediate,
+                mergeStorage,
+                updateDebugPanel
+            };
+        })();
 
         function markCloudSyncDirty(reason = 'state-change') {
             try {
@@ -4012,30 +4335,7 @@
         }
 
         function mergeReaderProgressStorage(localStorageValue = {}, cloudStorageValue = {}) {
-            const merged = { version: 1, books: {} };
-            const localBooks = localStorageValue?.books || {};
-            const cloudBooks = cloudStorageValue?.books || {};
-            const keys = new Set([...Object.keys(cloudBooks), ...Object.keys(localBooks)]);
-            keys.forEach(key => {
-                const localProgress = normalizeReaderProgress(localBooks[key]);
-                const cloudProgress = normalizeReaderProgress(cloudBooks[key]);
-                const validCandidates = [localProgress, cloudProgress].filter(isValidReaderProgress);
-                if (!validCandidates.length) return;
-                const chosen = validCandidates.sort((a, b) => getReaderProgressTime(b) - getReaderProgressTime(a))[0];
-                merged.books[key] = {
-                    ...chosen,
-                    bookId: localBooks[key]?.bookId || cloudBooks[key]?.bookId || '',
-                    bookKey: localBooks[key]?.bookKey || cloudBooks[key]?.bookKey || '',
-                    title: localBooks[key]?.title || cloudBooks[key]?.title || ''
-                };
-                logReaderDebug('progress-merge', {
-                    key,
-                    local: localProgress,
-                    cloud: cloudProgress,
-                    chosen
-                });
-            });
-            return merged;
+            return progressManager.mergeStorage(localStorageValue, cloudStorageValue);
         }
 
         function mergeReaderNotes(localNotes = [], cloudNotes = []) {
@@ -4057,9 +4357,9 @@
             if (!localBook || !cloudBook) {
                 const single = normalizeCloudReaderBooks([localBook || cloudBook])[0] || null;
                 if (!single) return null;
-                const localStorageProgress = getStoredReaderProgress(single);
-                const cloudSnapshotProgress = getReaderProgressFromStorageForBook(lastCloudReaderProgressStorage, single, 'cloudSnapshot');
-                single.progress = chooseLatestReaderProgress(localStorageProgress, single.progress, cloudSnapshotProgress);
+                const localStorageProgress = progressManager.readLocal(single);
+                const cloudSnapshotProgress = progressManager.readCloud(single);
+                single.progress = progressManager.chooseRestoreProgress(single, single.progress);
                 logReaderDebug('reader-book-progress-merge', {
                     bookId: single.id || '',
                     localStorage: localStorageProgress,
@@ -4072,14 +4372,11 @@
             const preferLocal = getReaderBookUpdatedMs(localBook) >= getReaderBookUpdatedMs(cloudBook);
             const preferred = preferLocal ? localBook : cloudBook;
             const fallback = preferLocal ? cloudBook : localBook;
-            const localStorageProgress = getStoredReaderProgress(localBook || cloudBook);
-            const cloudSnapshotProgress = getReaderProgressFromStorageForBook(lastCloudReaderProgressStorage, localBook || cloudBook, 'cloudSnapshot');
-            const progress = chooseLatestReaderProgress(
-                localStorageProgress,
-                localBook.progress,
-                cloudBook.progress,
-                cloudSnapshotProgress
-            );
+            const mergedBookSeed = { ...fallback, ...preferred };
+            const localStorageProgress = progressManager.readLocal(mergedBookSeed);
+            const cloudSnapshotProgress = progressManager.readCloud(mergedBookSeed);
+            const progress = localStorageProgress
+                || chooseLatestReaderProgress(localBook.progress, cloudBook.progress, cloudSnapshotProgress);
             logReaderDebug('reader-book-progress-merge', {
                 bookId: localBook?.id || cloudBook?.id || '',
                 localStorage: localStorageProgress,
@@ -4096,6 +4393,10 @@
                     ...(cloudBook.highlightedOccurrences || []),
                     ...(localBook.highlightedOccurrences || [])
                 ]),
+                errataAnchors: {
+                    ...(cloudBook.errataAnchors && typeof cloudBook.errataAnchors === 'object' ? cloudBook.errataAnchors : {}),
+                    ...(localBook.errataAnchors && typeof localBook.errataAnchors === 'object' ? localBook.errataAnchors : {})
+                },
                 notes: mergeReaderNotes(localBook.notes, cloudBook.notes),
                 updatedAt: Math.max(getReaderBookUpdatedMs(localBook), getReaderBookUpdatedMs(cloudBook), Date.now())
             };
@@ -4128,8 +4429,11 @@
         }
 
         function prepareReaderBookForCloud(book) {
+            const localProgress = progressManager.readLocal(book);
             return {
                 ...book,
+                bookKey: progressManager.getStableBookKey(book) || book.bookKey || '',
+                progress: localProgress || normalizeReaderProgress(book?.progress) || createReaderProgress(),
                 syncMeta: {
                     clientId: CLOUD_SYNC_CLIENT_ID,
                     savedAt: new Date().toISOString()
@@ -4182,12 +4486,12 @@
         async function hydrateLocalFromCloudData(data = {}, readerBookList = null) {
             cloudHydrating = true;
             try {
-                lastCloudReaderProgressStorage = data.readerProgressStorage || { version: 1, books: {} };
+                lastCloudReaderProgressStorage = progressManager.mergeStorage({}, data.readerProgressStorage || { version: 2, books: {}, stableBooks: {} });
                 const localAppState = readLocalAppStatePayload();
                 const mergedAppState = mergeAppStatePayload(localAppState, data.appState || {});
                 const mergedProgressStorage = mergeReaderProgressStorage(
                     loadReaderProgressStorage(),
-                    data.readerProgressStorage || { version: 1, books: {} }
+                    data.readerProgressStorage || { version: 2, books: {}, stableBooks: {} }
                 );
 
                 let localReaderSettings = {};
@@ -4223,9 +4527,10 @@
                 .filter(book => book && book.id && typeof book.text === 'string')
                 .map(book => ({
                     ...book,
-                    bookKey: book.bookKey || (book.fileHash ? `hash:${book.fileHash}` : getReaderBookFallbackKey(book)),
+                    bookKey: progressManager.getStableBookKey(book) || book.bookKey || getReaderBookFallbackKey(book),
                     progress: normalizeReaderProgress(book.progress) || createReaderProgress(),
                     highlightedOccurrences: Array.isArray(book.highlightedOccurrences) ? book.highlightedOccurrences : [],
+                    errataAnchors: book.errataAnchors && typeof book.errataAnchors === 'object' ? book.errataAnchors : {},
                     notes: normalizeReaderNotes(book.notes),
                     updatedAt: book.updatedAt || Date.now(),
                     createdAt: book.createdAt || book.updatedAt || Date.now()
@@ -5869,44 +6174,15 @@
         }
 
         function loadReaderProgressStorage() {
-            try {
-                const stored = JSON.parse(localStorage.getItem(LOCAL_STORAGE_KEY_READER_PROGRESS) || '{}');
-                if (stored && typeof stored === 'object') {
-                    return {
-                        version: 1,
-                        books: stored.books && typeof stored.books === 'object' ? stored.books : {}
-                    };
-                }
-            } catch (error) {
-                console.error('Reader progress load failed:', error);
-            }
-            return { version: 1, books: {} };
+            return progressManager.loadStorage();
         }
 
         function saveReaderProgressStorage(storage, options = {}) {
-            const { syncCloud = true, reason = 'reader-progress' } = options;
-            try {
-                localStorage.setItem(LOCAL_STORAGE_KEY_READER_PROGRESS, JSON.stringify({
-                    version: 1,
-                    books: storage.books || {}
-                }));
-                if (syncCloud) scheduleCloudSync(reason);
-                return true;
-            } catch (error) {
-                reportReaderProgressSaveError(error, 'local');
-                return false;
-            }
+            return progressManager.saveStorage(storage, options);
         }
 
         function getReaderBookKeys(book) {
-            if (!book) return [];
-            const keys = [];
-            if (book.id) keys.push(`id:${book.id}`);
-            if (book.bookKey) keys.push(String(book.bookKey));
-            if (book.fileHash) keys.push(`hash:${book.fileHash}`);
-            const fallbackKey = getReaderBookFallbackKey(book);
-            if (fallbackKey) keys.push(fallbackKey);
-            return [...new Set(keys.filter(Boolean))];
+            return progressManager.getBookKeys(book);
         }
 
         function getReaderBookFallbackKey(book) {
@@ -5941,6 +6217,7 @@
                 flow: raw.flow === 'paged' ? 'paged' : 'scroll',
                 scrollTop: Math.max(0, Math.round(Number(raw.scrollTop) || 0)),
                 pageIndex: Math.max(0, Math.round(Number(raw.pageIndex) || 0)),
+                virtualPageIndex: Math.max(0, Math.round(Number(raw.virtualPageIndex ?? raw.pageIndex) || 0)),
                 percent: Math.min(100, Math.max(0, Math.round(Number(raw.percent) || 0))),
                 updatedAt
             };
@@ -5979,36 +6256,36 @@
         }
 
         function getReaderProgressCandidatesFromStorage(storage, book, source = 'storage') {
-            const books = storage?.books || {};
-            return getReaderBookKeys(book)
-                .map(key => ({
-                    key,
-                    source,
-                    progress: normalizeReaderProgress(books[key])
-                }))
-                .filter(item => item.progress && isValidReaderProgress(item.progress));
+            const books = storage?.books && typeof storage.books === 'object' ? storage.books : {};
+            const stableBooks = storage?.stableBooks && typeof storage.stableBooks === 'object' ? storage.stableBooks : {};
+            const stableKey = progressManager.getStableBookKey(book);
+            const candidates = [];
+            if (stableKey && stableBooks[stableKey]) {
+                candidates.push({ key: stableKey, source: `${source}:stable`, progress: normalizeReaderProgress(stableBooks[stableKey]) });
+            }
+            getReaderBookKeys(book).forEach(key => {
+                if (!books[key]) return;
+                candidates.push({ key, source, progress: normalizeReaderProgress(books[key]) });
+            });
+            return candidates.filter(item => item.progress && isValidReaderProgress(item.progress));
         }
 
         function getReaderProgressFromStorageForBook(storage, book, source = 'storage') {
+            if (source === 'cloudSnapshot') return progressManager.readCloud(book);
+            if (storage === lastCloudReaderProgressStorage) return progressManager.readCloud(book);
             return getReaderProgressCandidatesFromStorage(storage, book, source)
                 .sort((a, b) => getReaderProgressTime(b.progress) - getReaderProgressTime(a.progress))[0]?.progress || null;
         }
 
         function getStoredReaderProgress(book) {
-            const storage = loadReaderProgressStorage();
-            const idProgress = book?.id ? normalizeReaderProgress(storage.books[`id:${book.id}`]) : null;
-            if (idProgress && isValidReaderProgress(idProgress)) return idProgress;
-
-            return getReaderProgressCandidatesFromStorage(storage, book, 'localStorage')
-                .filter(item => !item.key.startsWith('id:'))
-                .sort((a, b) => getReaderProgressTime(b.progress) - getReaderProgressTime(a.progress))[0]?.progress || null;
+            return progressManager.readLocal(book);
         }
 
         function getReaderProgressForBook(book) {
-            const localStorageProgress = getStoredReaderProgress(book);
+            const localStorageProgress = progressManager.readLocal(book);
             const indexedDbProgress = normalizeReaderProgress(book?.progress);
-            const cloudProgress = getReaderProgressFromStorageForBook(lastCloudReaderProgressStorage, book, 'cloudSnapshot');
-            const chosen = chooseLatestReaderProgress(localStorageProgress, indexedDbProgress, cloudProgress);
+            const cloudProgress = progressManager.readCloud(book);
+            const chosen = progressManager.chooseRestoreProgress(book, indexedDbProgress);
             logReaderDebug('restore-candidates', {
                 bookId: book?.id || '',
                 localStorage: localStorageProgress,
@@ -6020,27 +6297,7 @@
         }
 
         function saveReaderProgressLocally(book, progress, options = {}) {
-            const normalizedProgress = normalizeReaderProgress(progress);
-            if (!book || !normalizedProgress) return;
-
-            const storage = loadReaderProgressStorage();
-            const keys = getReaderBookKeys(book);
-            keys.forEach(key => {
-                storage.books[key] = {
-                    ...normalizedProgress,
-                    bookId: book.id || '',
-                    bookKey: book.bookKey || '',
-                    title: book.title || ''
-                };
-            });
-            saveReaderProgressStorage(storage, options);
-            logReaderDebug('progress-save-local', {
-                reason: options.reason || 'reader-progress',
-                pageIndex: normalizedProgress.pageIndex,
-                percent: normalizedProgress.percent,
-                updatedAt: normalizedProgress.updatedAt,
-                keys
-            });
+            return progressManager.commitProgressImmediate(book, progress, options.reason || 'reader-progress');
         }
 
         function removeReaderProgressLocally(book, options = {}) {
@@ -6048,7 +6305,10 @@
             const storage = loadReaderProgressStorage();
             getReaderBookKeys(book).forEach(key => {
                 delete storage.books[key];
+                if (storage.stableBooks) delete storage.stableBooks[key];
             });
+            const stableBookKey = progressManager.getStableBookKey(book);
+            if (stableBookKey && storage.stableBooks) delete storage.stableBooks[stableBookKey];
             saveReaderProgressStorage(storage, options);
         }
 
@@ -6229,14 +6489,15 @@
             const savedProgress = getReaderProgressForBook(book);
             currentReaderBook = {
                 ...book,
-                bookKey: book.bookKey || (book.fileHash ? `hash:${book.fileHash}` : getReaderBookFallbackKey(book)),
+                bookKey: progressManager.getStableBookKey(book) || book.bookKey || getReaderBookFallbackKey(book),
                 progress: savedProgress,
                 highlightedOccurrences: Array.isArray(book.highlightedOccurrences) ? book.highlightedOccurrences : [],
+                errataAnchors: book.errataAnchors && typeof book.errataAnchors === 'object' ? book.errataAnchors : {},
                 notes: normalizeReaderNotes(book.notes)
             };
             readerSettings.lastBookId = currentReaderBook.id;
             saveReaderSettings();
-            saveReaderProgressLocally(currentReaderBook, savedProgress);
+            progressManager.commitProgressImmediate(currentReaderBook, savedProgress, 'reader-open-restore');
             currentReaderHighlightedSet = new Set(currentReaderBook.highlightedOccurrences || []);
             currentReaderNotesByParagraph = buildReaderNotesByParagraph(currentReaderBook);
             currentReaderTokenCache = new Map();
@@ -6413,6 +6674,9 @@
             if (!normalized) return 0;
             if (normalized.flow === 'paged' || normalized.pageIndex > 0) {
                 return Math.min(pageCount - 1, Math.max(0, normalized.pageIndex || 0));
+            }
+            if (normalized.virtualPageIndex > 0) {
+                return Math.min(pageCount - 1, Math.max(0, normalized.virtualPageIndex || 0));
             }
             if (normalized.scrollTop > 0 && readerVirtualPageHeights.length) {
                 return Math.min(pageCount - 1, Math.max(0, getReaderVirtualPageIndexFromScroll(normalized.scrollTop)));
@@ -6647,26 +6911,32 @@
             const tokenIndexes = Array.isArray(raw.tokenIndexes) ? raw.tokenIndexes.filter(Boolean).map(String) : [];
             const normalizedStart = Math.max(0, Math.round(startOffset));
             const normalizedEnd = Math.max(normalizedStart, Math.round(endOffset));
+            const pageIndex = readFiniteReaderNumber(raw.pageIndex, raw.anchor?.pageIndex, raw.position?.pageIndex);
+            const normalizedPageIndex = pageIndex === null ? null : Math.max(0, Math.round(pageIndex));
             return {
                 id,
                 bookId: raw.bookId || currentReaderBook?.id || '',
-                bookKey: raw.bookKey || currentReaderBook?.bookKey || '',
+                bookKey: raw.bookKey || progressManager.getStableBookKey(currentReaderBook) || currentReaderBook?.bookKey || '',
                 kind: raw.kind === 'word' ? 'word' : 'selection',
                 selectedText,
+                anchorText: String(raw.anchorText || selectedText || ''),
                 content,
                 context: String(raw.context || ''),
                 beforeContext: String(raw.beforeContext || ''),
                 afterContext: String(raw.afterContext || ''),
                 tokenIndexes,
+                pageIndex: normalizedPageIndex,
                 anchor: {
                     paragraphIndex: Math.max(0, Math.round(paragraphIndex)),
                     startOffset: normalizedStart,
-                    endOffset: normalizedEnd
+                    endOffset: normalizedEnd,
+                    pageIndex: normalizedPageIndex
                 },
                 position: {
                     paragraphIndex: Math.max(0, Math.round(paragraphIndex)),
                     startOffset: normalizedStart,
                     endOffset: normalizedEnd,
+                    pageIndex: normalizedPageIndex,
                     locationKey: `${Math.max(0, Math.round(paragraphIndex))}:${normalizedStart}-${normalizedEnd}`
                 },
                 createdAt: raw.createdAt || new Date().toISOString(),
@@ -6794,6 +7064,7 @@
                 flow: readerSettings?.flow || 'scroll',
                 scrollTop: 0,
                 pageIndex: 0,
+                virtualPageIndex: 0,
                 percent: 0,
                 updatedAt: null
             };
@@ -6816,6 +7087,7 @@
                 readerProgressPercent.textContent = '0%';
                 readerProgressFill.style.width = '0%';
                 readerPageControls.classList.add('hidden');
+                progressManager.updateDebugPanel();
                 return;
             }
 
@@ -6834,6 +7106,7 @@
                 readerPageControls.classList.add('hidden');
                 readerProgressLabel.textContent = '滚动阅读';
             }
+            progressManager.updateDebugPanel();
         }
 
         function restoreReaderProgress() {
@@ -6841,7 +7114,7 @@
                 updateReaderProgressDisplay();
                 return;
             }
-            const progress = chooseLatestReaderProgress(currentReaderBook.progress, getStoredReaderProgress(currentReaderBook));
+            const progress = progressManager.chooseRestoreProgress(currentReaderBook, currentReaderBook.progress);
             currentReaderBook.progress = progress;
             if (readerSettings.flow === 'paged') {
                 const pageCount = Math.max(1, currentReaderPages.length);
@@ -6913,6 +7186,7 @@
                 flow: readerSettings.flow || 'scroll',
                 scrollTop: Math.max(0, Math.round(readerStage.scrollTop || 0)),
                 pageIndex: readerSettings.flow === 'paged' ? currentReaderPageIndex : currentReaderVirtualPageIndex,
+                virtualPageIndex: currentReaderVirtualPageIndex,
                 percent: getReaderProgressPercent(),
                 updatedAt: now || getNextReaderProgressTimestamp()
             };
@@ -6922,12 +7196,13 @@
             const { syncCloud = true, reason = 'reader-progress' } = options;
             if (!currentReaderBook) return null;
             const progress = captureReaderProgress();
-            currentReaderBook = { ...currentReaderBook, progress, updatedAt: Date.now() };
+            const committedProgress = progressManager.commitProgressImmediate(currentReaderBook, progress, reason) || progress;
+            currentReaderBook = { ...currentReaderBook, progress: committedProgress, updatedAt: Date.now() };
             lastReaderProgressPersistAt = Date.now();
-            saveReaderProgressLocally(currentReaderBook, progress, { syncCloud, reason });
             const index = readerBooks.findIndex(book => book.id === currentReaderBook.id);
             if (index > -1) readerBooks[index] = currentReaderBook;
-            return progress;
+            if (!syncCloud) markCloudSyncDirty(reason);
+            return committedProgress;
         }
 
         function clearReaderProgressTimers() {
@@ -7009,7 +7284,13 @@
             hideReaderPopover();
             renderReaderPageContent();
             readerStage.scrollTop = 0;
-            commitReaderPositionChange('reader-page-change');
+            const progress = progressManager.commitProgressImmediate(currentReaderBook, captureReaderProgress(), 'reader-page-change');
+            if (progress) {
+                currentReaderBook = { ...currentReaderBook, progress, updatedAt: Date.now() };
+                const index = readerBooks.findIndex(book => book.id === currentReaderBook.id);
+                if (index > -1) readerBooks[index] = currentReaderBook;
+            }
+            scheduleReaderBookProgressPersist('reader-page-change');
             markStudyInteraction();
         }
 
@@ -7079,6 +7360,7 @@
                     text,
                     progress: createReaderProgress(),
                     highlightedOccurrences: [],
+                    errataAnchors: {},
                     notes: [],
                     createdAt: now,
                     updatedAt: now
@@ -7389,38 +7671,81 @@
                 .trim();
         }
 
+        function buildReaderErrataAnchorForToken(tokenIndex, fallbackWord = '') {
+            const position = parseReaderTokenIndex(tokenIndex);
+            const paragraphIndex = Number.isFinite(Number(position?.paragraphIndex))
+                ? Math.max(0, Math.round(Number(position.paragraphIndex)))
+                : Math.max(0, Math.round(Number(currentReaderSelection?.paragraphIndex) || 0));
+            const paragraphText = getReaderParagraphText(paragraphIndex);
+            const tokens = getReaderTokensForParagraph(paragraphIndex, paragraphText);
+            const token = Number.isFinite(Number(position?.wordIndex)) ? tokens[position.wordIndex] : null;
+            const startOffset = Number.isFinite(Number(token?.start)) ? token.start : Math.max(0, Math.round(Number(currentReaderSelection?.startOffset) || 0));
+            const endOffset = Number.isFinite(Number(token?.end)) ? token.end : Math.max(startOffset, Math.round(Number(currentReaderSelection?.endOffset) || startOffset));
+            const anchorText = String(token?.text || fallbackWord || currentReaderSelection?.text || paragraphText.slice(startOffset, endOffset)).trim();
+            const pageIndex = Math.max(0, getReaderPageIndexForParagraph(paragraphIndex));
+            return {
+                type: 'errata',
+                bookKey: progressManager.getStableBookKey(currentReaderBook) || currentReaderBook?.bookKey || '',
+                pageIndex,
+                paragraphIndex,
+                tokenIndex: String(tokenIndex || ''),
+                wordIndex: Number.isFinite(Number(position?.wordIndex)) ? Math.max(0, Math.round(Number(position.wordIndex))) : 0,
+                word: normalizeReaderWord(anchorText),
+                anchorText,
+                context: paragraphText,
+                startOffset,
+                endOffset,
+                updatedAt: new Date().toISOString()
+            };
+        }
+
         function getCurrentReaderBookErrataOccurrences() {
             const tokenIndexes = Array.from(new Set(currentReaderBook?.highlightedOccurrences || []));
+            const errataAnchors = currentReaderBook?.errataAnchors && typeof currentReaderBook.errataAnchors === 'object'
+                ? currentReaderBook.errataAnchors
+                : {};
             return tokenIndexes
                 .map(tokenIndex => {
                     const position = parseReaderTokenIndex(tokenIndex);
-                    if (!position) return null;
-                    const paragraphText = getReaderParagraphText(position.paragraphIndex);
-                    const token = getReaderTokensForParagraph(position.paragraphIndex, paragraphText)[position.wordIndex];
+                    const storedAnchor = errataAnchors[tokenIndex] || {};
+                    const paragraphIndex = Number.isFinite(Number(storedAnchor.paragraphIndex))
+                        ? Math.max(0, Math.round(Number(storedAnchor.paragraphIndex)))
+                        : position?.paragraphIndex;
+                    const wordIndex = position?.wordIndex;
+                    if (!Number.isFinite(paragraphIndex)) return null;
+                    const paragraphText = getReaderParagraphText(paragraphIndex);
+                    const token = Number.isFinite(wordIndex)
+                        ? getReaderTokensForParagraph(paragraphIndex, paragraphText)[wordIndex]
+                        : null;
                     if (!token) {
+                        const anchorText = String(storedAnchor.anchorText || storedAnchor.word || '').trim();
                         return {
                             tokenIndex,
-                            paragraphIndex: position.paragraphIndex,
-                            wordIndex: position.wordIndex,
-                            word: '错词',
-                            normalized: '',
+                            paragraphIndex,
+                            pageIndex: Number.isFinite(Number(storedAnchor.pageIndex)) ? Math.max(0, Math.round(Number(storedAnchor.pageIndex))) : getReaderPageIndexForParagraph(paragraphIndex),
+                            wordIndex: Number.isFinite(wordIndex) ? wordIndex : 0,
+                            word: anchorText || '错词',
+                            normalized: normalizeReaderWord(storedAnchor.word || anchorText),
                             startOffset: 0,
                             endOffset: 0,
-                            snippet: paragraphText
+                            snippet: storedAnchor.context || (paragraphText
                                 ? buildReaderErrataSnippet(paragraphText, 0, Math.min(36, paragraphText.length))
-                                : `第 ${position.paragraphIndex + 1} 段`,
+                                : `第 ${paragraphIndex + 1} 段`),
+                            anchor: storedAnchor,
                             invalidToken: true
                         };
                     }
                     return {
                         tokenIndex,
-                        paragraphIndex: position.paragraphIndex,
-                        wordIndex: position.wordIndex,
+                        paragraphIndex,
+                        pageIndex: Number.isFinite(Number(storedAnchor.pageIndex)) ? Math.max(0, Math.round(Number(storedAnchor.pageIndex))) : getReaderPageIndexForParagraph(paragraphIndex),
+                        wordIndex,
                         word: token.text,
                         normalized: token.normalized,
                         startOffset: token.start,
                         endOffset: token.end,
-                        snippet: buildReaderErrataSnippet(paragraphText, token.start, token.end)
+                        snippet: buildReaderErrataSnippet(paragraphText, token.start, token.end),
+                        anchor: storedAnchor
                     };
                 })
                 .filter(Boolean)
@@ -7489,6 +7814,8 @@
                 afterContext: note.afterContext || '',
                 tokenIndexes: Array.isArray(note.tokenIndexes) ? note.tokenIndexes : [],
                 anchor: { ...anchor },
+                pageIndex: readFiniteReaderNumber(note.pageIndex, anchor.pageIndex),
+                anchorText: note.anchorText || note.selectedText,
                 paragraphIndex: anchor.paragraphIndex,
                 startOffset: anchor.startOffset,
                 endOffset: anchor.endOffset,
@@ -7540,23 +7867,28 @@
             const contextWindow = getReaderNoteContextWindow(paragraphText, anchor.startOffset, anchor.endOffset);
             const now = new Date().toISOString();
             const id = existingNote?.id || `note-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+            const pageIndex = Math.max(0, getReaderPageIndexForParagraph(anchor.paragraphIndex));
+            const bookKey = progressManager.getStableBookKey(currentReaderBook) || currentReaderBook.bookKey || '';
 
             return {
                 id,
                 bookId: currentReaderBook.id,
-                bookKey: currentReaderBook.bookKey || '',
+                bookKey,
                 kind: selection.kind === 'word' ? 'word' : 'selection',
                 selectedText,
+                anchorText: selectedText,
                 content,
                 context: paragraphText,
                 beforeContext: contextWindow.beforeContext,
                 afterContext: contextWindow.afterContext,
                 tokenIndexes: Array.isArray(selection.tokenIndexes) ? selection.tokenIndexes.filter(Boolean).map(String) : [],
-                anchor,
+                pageIndex,
+                anchor: { ...anchor, pageIndex },
                 position: {
                     paragraphIndex: anchor.paragraphIndex,
                     startOffset: anchor.startOffset,
                     endOffset: anchor.endOffset,
+                    pageIndex,
                     locationKey: `${anchor.paragraphIndex}:${anchor.startOffset}-${anchor.endOffset}`
                 },
                 createdAt: existingNote?.createdAt || now,
@@ -7743,35 +8075,175 @@
             return best.score > 0 ? best.index : preferredIndex;
         }
 
-        async function jumpToReaderNote(noteId) {
-            const note = getReaderNoteById(noteId);
-            if (!note) return;
-            const paragraphIndex = findReaderNoteFallbackParagraphIndex(note);
-            const pageIndex = ensureReaderPageVisibleForParagraph(paragraphIndex);
+        function findReaderAnchorParagraphByContext(anchor, preferredIndex) {
+            const preferred = Math.max(0, Math.round(Number(preferredIndex) || 0));
+            const anchorText = normalizeReaderAnchorText(anchor?.anchorText || anchor?.selectedText || anchor?.word || '');
+            const context = normalizeReaderAnchorText(anchor?.context || '');
+            if (!anchorText && !context) return preferred;
 
-            hideReaderNotesPanel();
-            const element = await waitForReaderRenderedTarget(() => {
-                return readerContent.querySelector(`[data-note-id="${escapeReaderCssValue(note.id)}"]`)
-                    || readerContent.querySelector(`p[data-paragraph-index="${paragraphIndex}"]`);
-            });
-            const exactElement = element?.matches?.(`[data-note-id="${escapeReaderCssValue(note.id)}"]`) ? element : null;
-            const paragraph = exactElement ? exactElement : readerContent.querySelector(`p[data-paragraph-index="${paragraphIndex}"]`);
-            if (exactElement) {
-                revealReaderNoteElement(note.id, { behavior: 'auto' });
-            } else if (paragraph) {
-                scrollReaderElementIntoView(paragraph, { behavior: 'auto' });
-                flashReaderAnchorFallback(paragraph);
+            const start = Math.max(0, preferred - 8);
+            const end = Math.min(currentReaderParagraphs.length - 1, preferred + 8);
+            let best = { index: preferred, score: 0 };
+            for (let index = start; index <= end; index += 1) {
+                const text = normalizeReaderAnchorText(getReaderParagraphText(index));
+                if (!text) continue;
+                let score = index === preferred ? 2 : 0;
+                if (anchorText && text.includes(anchorText)) score += 100;
+                if (context && (text.includes(context) || context.includes(text.slice(0, Math.min(160, text.length))))) score += 40;
+                if (score > best.score) best = { index, score };
             }
-            logReaderDebug('note-jump', {
-                noteId,
+            return best.score > 0 ? best.index : preferred;
+        }
+
+        function buildReaderNoteJumpAnchor(note) {
+            const paragraphIndex = findReaderNoteFallbackParagraphIndex(note);
+            const rawPageIndex = readFiniteReaderNumber(note?.pageIndex, note?.anchor?.pageIndex, note?.position?.pageIndex);
+            return {
+                type: 'note',
+                noteId: note.id,
+                bookKey: note.bookKey || progressManager.getStableBookKey(currentReaderBook) || currentReaderBook?.bookKey || '',
+                pageIndex: rawPageIndex === null ? getReaderPageIndexForParagraph(paragraphIndex) : Math.max(0, Math.round(rawPageIndex)),
+                paragraphIndex,
+                anchorText: note.anchorText || note.selectedText || '',
+                context: note.context || '',
+                beforeContext: note.beforeContext || '',
+                afterContext: note.afterContext || '',
+                tokenIndex: Array.isArray(note.tokenIndexes) ? note.tokenIndexes[0] : ''
+            };
+        }
+
+        function buildReaderErrataJumpAnchor(tokenIndex, fallbackWord = '') {
+            const storedAnchor = currentReaderBook?.errataAnchors?.[tokenIndex] || null;
+            const occurrence = findReaderErrataFallbackOccurrence(tokenIndex, fallbackWord);
+            if (!storedAnchor && !occurrence) return null;
+            const paragraphIndex = Math.max(0, Math.round(Number(storedAnchor?.paragraphIndex ?? occurrence?.paragraphIndex) || 0));
+            const pageIndex = readFiniteReaderNumber(storedAnchor?.pageIndex, occurrence?.pageIndex, getReaderPageIndexForParagraph(paragraphIndex));
+            return {
+                type: 'errata',
+                bookKey: storedAnchor?.bookKey || progressManager.getStableBookKey(currentReaderBook) || currentReaderBook?.bookKey || '',
+                pageIndex: pageIndex === null ? getReaderPageIndexForParagraph(paragraphIndex) : Math.max(0, Math.round(pageIndex)),
+                paragraphIndex,
+                tokenIndex: occurrence?.tokenIndex || storedAnchor?.tokenIndex || String(tokenIndex || ''),
+                originalTokenIndex: String(tokenIndex || ''),
+                word: occurrence?.normalized || storedAnchor?.word || normalizeReaderWord(fallbackWord),
+                anchorText: storedAnchor?.anchorText || occurrence?.word || fallbackWord || '',
+                context: storedAnchor?.context || getReaderParagraphText(paragraphIndex),
+                relocated: Boolean(occurrence?.relocated),
+                invalidToken: Boolean(occurrence?.invalidToken)
+            };
+        }
+
+        function getReaderAnchorParagraphElement(paragraphIndex) {
+            if (!Number.isFinite(Number(paragraphIndex))) return null;
+            return readerContent.querySelector(`p[data-paragraph-index="${escapeReaderCssValue(Math.max(0, Math.round(Number(paragraphIndex))))}"]`);
+        }
+
+        function resolveReaderAnchorPageIndex(anchor, paragraphIndex) {
+            const directPageIndex = Number(anchor?.pageIndex);
+            if (Number.isFinite(directPageIndex) && directPageIndex >= 0) {
+                return Math.min(Math.max(0, Math.round(directPageIndex)), Math.max(0, currentReaderPages.length - 1));
+            }
+            const pageIndex = getReaderPageIndexForParagraph(paragraphIndex);
+            return pageIndex >= 0 ? pageIndex : 0;
+        }
+
+        function loadReaderAnchorPage(pageIndex) {
+            const pageCount = Math.max(1, currentReaderPages.length);
+            const targetPageIndex = Math.min(pageCount - 1, Math.max(0, Math.round(Number(pageIndex) || 0)));
+            logReaderDebug('anchor-load-page', { pageIndex: targetPageIndex, flow: readerSettings.flow });
+            if (readerSettings.flow === 'paged') {
+                currentReaderPageIndex = targetPageIndex;
+                currentReaderVirtualPageIndex = targetPageIndex;
+                renderReaderPageContent();
+                readerStage.scrollTop = 0;
+                return targetPageIndex;
+            }
+
+            currentReaderVirtualPageIndex = targetPageIndex;
+            readerVirtualScrollApplying = true;
+            renderReaderPageContent();
+            readerStage.scrollTop = getReaderVirtualOffsetBeforePage(targetPageIndex);
+            requestAnimationFrame(() => {
+                readerVirtualScrollApplying = false;
+                updateReaderProgressDisplay();
+            });
+            return targetPageIndex;
+        }
+
+        function findReaderAnchorExactElement(anchor, paragraphElement = null) {
+            if (anchor?.type === 'note' && anchor.noteId) {
+                return readerContent.querySelector(`[data-note-id="${escapeReaderCssValue(anchor.noteId)}"]`);
+            }
+            if (anchor?.type === 'errata') {
+                if (anchor.tokenIndex) {
+                    const tokenElement = readerContent.querySelector(`.reader-word[data-token-index="${escapeReaderCssValue(anchor.tokenIndex)}"]`);
+                    if (tokenElement) return tokenElement;
+                }
+                const normalizedWord = normalizeReaderWord(anchor.word || anchor.anchorText || '');
+                if (normalizedWord && paragraphElement) {
+                    return Array.from(paragraphElement.querySelectorAll('.reader-word'))
+                        .find(item => normalizeReaderWord(item.dataset.word || item.textContent) === normalizedWord) || null;
+                }
+            }
+            return null;
+        }
+
+        async function jumpToReaderAnchor(anchor) {
+            if (!currentReaderBook || !anchor) return false;
+            const preferredParagraph = Math.max(0, Math.round(Number(anchor.paragraphIndex) || 0));
+            const paragraphIndex = findReaderAnchorParagraphByContext(anchor, preferredParagraph);
+            let pageIndex = loadReaderAnchorPage(resolveReaderAnchorPageIndex(anchor, paragraphIndex));
+
+            let paragraphElement = await waitForReaderRenderedTarget(() => getReaderAnchorParagraphElement(paragraphIndex), 6000);
+            if (!paragraphElement) {
+                const fallbackPageIndex = getReaderPageIndexForParagraph(paragraphIndex);
+                if (fallbackPageIndex >= 0 && fallbackPageIndex !== pageIndex) {
+                    pageIndex = loadReaderAnchorPage(fallbackPageIndex);
+                    paragraphElement = await waitForReaderRenderedTarget(() => getReaderAnchorParagraphElement(paragraphIndex), 6000);
+                }
+            }
+
+            const exactElement = findReaderAnchorExactElement(anchor, paragraphElement);
+            const fallbackElement = paragraphElement || exactElement;
+            if (exactElement) {
+                if (anchor.type === 'note') {
+                    revealReaderNoteElement(anchor.noteId, { behavior: 'auto' });
+                    const note = getReaderNoteById(anchor.noteId);
+                    if (note) showReaderNotePopover(note);
+                } else {
+                    revealReaderErrataElement(exactElement.dataset.tokenIndex, { behavior: 'auto' });
+                    showReaderPopover(createReaderSelectionFromWordElement(exactElement));
+                }
+            } else if (fallbackElement) {
+                scrollReaderElementIntoView(fallbackElement, { behavior: 'auto' });
+                flashReaderAnchorFallback(fallbackElement);
+                if (anchor.type === 'note') {
+                    const note = getReaderNoteById(anchor.noteId);
+                    if (note) showReaderNotePopover(note);
+                }
+            }
+
+            logReaderDebug('anchor-jump', {
+                type: anchor.type,
+                noteId: anchor.noteId || '',
+                tokenIndex: anchor.tokenIndex || '',
                 paragraphIndex,
                 pageIndex,
                 foundDom: Boolean(exactElement),
-                fallback: !exactElement
+                fallback: !exactElement,
+                anchorText: anchor.anchorText || '',
+                context: anchor.context || ''
             });
-            showReaderNotePopover(note);
-            commitReaderPositionChange('reader-note-jump');
+            commitReaderPositionChange(`reader-${anchor.type || 'anchor'}-jump`);
             markStudyInteraction();
+            return Boolean(exactElement || fallbackElement);
+        }
+
+        async function jumpToReaderNote(noteId) {
+            const note = getReaderNoteById(noteId);
+            if (!note) return;
+            hideReaderNotesPanel();
+            await jumpToReaderAnchor(buildReaderNoteJumpAnchor(note));
         }
 
         function revealReaderNoteElement(noteId, options = {}) {
@@ -7847,39 +8319,8 @@
         }
 
         async function jumpToReaderErrataOccurrence(tokenIndex, fallbackWord = '') {
-            const occurrence = findReaderErrataFallbackOccurrence(tokenIndex, fallbackWord);
-            if (!occurrence) return;
-
-            ensureReaderPageVisibleForParagraph(occurrence.paragraphIndex);
-
             hideReaderBookErrataPanel();
-            const element = await waitForReaderRenderedTarget(() => {
-                return readerContent.querySelector(`.reader-word[data-token-index="${escapeReaderCssValue(occurrence.tokenIndex)}"]`)
-                    || readerContent.querySelector(`p[data-paragraph-index="${occurrence.paragraphIndex}"]`);
-            });
-            const exactElement = element?.matches?.('.reader-word') ? element : null;
-            if (exactElement) {
-                revealReaderErrataElement(occurrence.tokenIndex, { behavior: 'auto' });
-                showReaderPopover(createReaderSelectionFromWordElement(exactElement));
-            } else {
-                const paragraph = readerContent.querySelector(`p[data-paragraph-index="${occurrence.paragraphIndex}"]`);
-                if (paragraph) {
-                    scrollReaderElementIntoView(paragraph, { behavior: 'auto' });
-                    flashReaderAnchorFallback(paragraph);
-                }
-            }
-            logReaderDebug('errata-jump', {
-                tokenIndex,
-                resolvedTokenIndex: occurrence.tokenIndex,
-                paragraphIndex: occurrence.paragraphIndex,
-                pageIndex: getReaderPageIndexForParagraph(occurrence.paragraphIndex),
-                foundDom: Boolean(exactElement),
-                fallback: !exactElement,
-                relocated: Boolean(occurrence.relocated),
-                invalidToken: Boolean(occurrence.invalidToken)
-            });
-            commitReaderPositionChange('reader-errata-jump');
-            markStudyInteraction();
+            await jumpToReaderAnchor(buildReaderErrataJumpAnchor(tokenIndex, fallbackWord));
         }
 
         function scrollReaderElementIntoView(element, options = {}) {
@@ -8098,10 +8539,17 @@
             const tokenIndexes = currentReaderSelection?.tokenIndexes || [];
             if (currentReaderBook && tokenIndexes.length) {
                 const highlightedOccurrences = new Set(currentReaderBook.highlightedOccurrences || []);
+                const errataAnchors = {
+                    ...(currentReaderBook.errataAnchors && typeof currentReaderBook.errataAnchors === 'object' ? currentReaderBook.errataAnchors : {})
+                };
                 tokenIndexes.forEach(tokenIndex => highlightedOccurrences.add(tokenIndex));
+                tokenIndexes.forEach(tokenIndex => {
+                    errataAnchors[tokenIndex] = buildReaderErrataAnchorForToken(tokenIndex, currentReaderSelection?.text || '');
+                });
                 currentReaderBook = {
                     ...currentReaderBook,
                     highlightedOccurrences: Array.from(highlightedOccurrences),
+                    errataAnchors,
                     updatedAt: Date.now()
                 };
                 currentReaderHighlightedSet = new Set(currentReaderBook.highlightedOccurrences || []);
@@ -8159,6 +8607,11 @@
                 ...currentReaderBook,
                 highlightedOccurrences: (currentReaderBook.highlightedOccurrences || [])
                     .filter(tokenIndex => !tokenIndexSet.has(tokenIndex)),
+                errataAnchors: Object.fromEntries(Object.entries(
+                    currentReaderBook.errataAnchors && typeof currentReaderBook.errataAnchors === 'object'
+                        ? currentReaderBook.errataAnchors
+                        : {}
+                ).filter(([tokenIndex]) => !tokenIndexSet.has(tokenIndex))),
                 updatedAt: Date.now()
             };
             currentReaderHighlightedSet = new Set(currentReaderBook.highlightedOccurrences || []);
