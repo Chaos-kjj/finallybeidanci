@@ -5,7 +5,8 @@
   "description": "Static PWA for English vocabulary and reading practice.",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "test": "node tests/regression.test.js"
   },
   "engines": {
     "node": ">=18"

@@ -3,8 +3,9 @@ const fs = require('fs');
 const path = require('path');
 
 const rootDir = __dirname;
-const port = Number(process.env.PORT || 3000);
+const preferredPort = Number(process.env.PORT || 3000);
 const host = process.env.HOST || '127.0.0.1';
+const maxPortAttempts = Number(process.env.PORT) ? 1 : 10;
 
 const mimeTypes = {
   '.css': 'text/css; charset=utf-8',
@@ -52,40 +53,60 @@ function resolveRequestPath(urlPath) {
   return filePath;
 }
 
-const server = http.createServer((req, res) => {
-  if (req.method !== 'GET' && req.method !== 'HEAD') {
-    send(res, 405, 'Method Not Allowed', { Allow: 'GET, HEAD' });
-    return;
-  }
-
-  const filePath = resolveRequestPath(req.url || '/');
-  if (!filePath) {
-    send(res, 403, 'Forbidden', { 'Content-Type': 'text/plain; charset=utf-8' });
-    return;
-  }
-
-  fs.stat(filePath, (statError, stat) => {
-    if (statError || !stat.isFile()) {
-      send(res, 404, 'Not Found', { 'Content-Type': 'text/plain; charset=utf-8' });
+function createStaticServer() {
+  return http.createServer((req, res) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      send(res, 405, 'Method Not Allowed', { Allow: 'GET, HEAD' });
       return;
     }
 
-    const contentType = mimeTypes[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
-    res.writeHead(200, {
-      'Cache-Control': 'no-store',
-      'Content-Length': stat.size,
-      'Content-Type': contentType
+    const filePath = resolveRequestPath(req.url || '/');
+    if (!filePath) {
+      send(res, 403, 'Forbidden', { 'Content-Type': 'text/plain; charset=utf-8' });
+      return;
+    }
+
+    fs.stat(filePath, (statError, stat) => {
+      if (statError || !stat.isFile()) {
+        send(res, 404, 'Not Found', { 'Content-Type': 'text/plain; charset=utf-8' });
+        return;
+      }
+
+      const contentType = mimeTypes[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
+      res.writeHead(200, {
+        'Cache-Control': 'no-store',
+        'Content-Length': stat.size,
+        'Content-Type': contentType
+      });
+
+      if (req.method === 'HEAD') {
+        res.end();
+        return;
+      }
+
+      fs.createReadStream(filePath).pipe(res);
     });
+  });
+}
 
-    if (req.method === 'HEAD') {
-      res.end();
+function listen(port, attemptsLeft = maxPortAttempts) {
+  const server = createStaticServer();
+
+  server.once('error', error => {
+    if (error.code === 'EADDRINUSE' && attemptsLeft > 1) {
+      console.warn(`Port ${port} is in use, trying ${port + 1}...`);
+      listen(port + 1, attemptsLeft - 1);
       return;
     }
 
-    fs.createReadStream(filePath).pipe(res);
+    console.error(`Unable to start finallybeidanci on ${host}:${port}`);
+    console.error(error);
+    process.exitCode = 1;
   });
-});
 
-server.listen(port, host, () => {
-  console.log(`finallybeidanci is running at http://${host}:${port}`);
-});
+  server.listen(port, host, () => {
+    console.log(`finallybeidanci is running at http://${host}:${port}`);
+  });
+}
+
+listen(preferredPort);
