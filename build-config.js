@@ -15,4 +15,4 @@ const output = [
 ].join('\n');
 
 fs.writeFileSync(path.join(__dirname, 'supabase-config.js'), output, 'utf8');
-console.log('Generated deploy/supabase-config.js');
+console.log('Generated supabase-config.js');

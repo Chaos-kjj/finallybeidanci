@@ -49,9 +49,13 @@
 npm start
 ```
 
-当前 `server.js` 会优先使用根目录 `index.html`；如果不存在，就自动托管 `deploy/` 目录。
+当前 `server.js` 会托管根目录静态文件，默认地址是 `http://127.0.0.1:3000`。如需更换端口：
 
-本地要测试云端同步时，可以直接编辑 `deploy/supabase-config.js` 和根目录 `supabase-config.js`，填入 Supabase Project URL 和 anon key。anon key 是浏览器端公开 key，不要填写 service role key。
+```bash
+PORT=3001 npm start
+```
+
+本地要测试云端同步时，可以直接编辑根目录 `supabase-config.js`，填入 Supabase Project URL 和 anon key。anon key 是浏览器端公开 key，不要填写 service role key。
 
 ## 数据同步范围
 

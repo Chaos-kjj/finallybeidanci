@@ -1,0 +1,13 @@
+{
+  "name": "finallybeidanci",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Static PWA for English vocabulary and reading practice.",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
