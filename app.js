@@ -41,6 +41,13 @@ const DEFAULT_READER_SETTINGS = Object.freeze({
     flow: 'scroll',
     lastBookId: ''
 });
+const DEFAULT_LEARNING_SETTINGS = Object.freeze({
+    newWordsPerDay: 10,
+    reviewWordsPerDay: 20,
+    mode: 'sentence',
+    updatedAt: null
+});
+const LEARNING_MODES = Object.freeze(['basic', 'sentence', 'listening']);
 const DEFAULT_AI_CONFIG = Object.freeze({
     provider: 'siliconflow',
     url: SILICONFLOW_API_URL,
@@ -50,7 +57,6 @@ const DEFAULT_AI_CONFIG = Object.freeze({
 
 // Ebbinghaus intervals in minutes: 5m, 30m, 12h, 1d, 2d, 4d, 7d, 15d, 30d
 const SRS_INTERVALS_MINUTES = [5, 30, 720, 1440, 2880, 5760, 10080, 21600, 43200];
-const NEW_WORDS_PER_SESSION = 10;
 const STUDY_STAT_KEYS = ['minutes', 'interactions', 'wordsKnown', 'wordsReviewed', 'readerMinutes', 'vocabMinutes'];
 
 function prepareStaticMarkup() {
@@ -283,6 +289,12 @@ const addWordInput = document.getElementById('add-word-input');
 const addWordBtn = document.getElementById('add-word-btn');
 const learnView = document.getElementById('learn-view');
 const wordSourceSelector = document.getElementById('word-source-selector');
+const learningSettingsToggle = document.getElementById('learning-settings-toggle');
+const learningSettingsPanel = document.getElementById('learning-settings-panel');
+const learningNewWordsInput = document.getElementById('learning-new-words-per-day');
+const learningReviewWordsInput = document.getElementById('learning-review-words-per-day');
+const learningModeSelect = document.getElementById('learning-mode-select');
+const learningPlanSummary = document.getElementById('learning-plan-summary');
 const mainWordEl = document.getElementById('main-word');
 const speakBtn = document.getElementById('speak-btn');
 const wordDetailsEl = document.getElementById('word-details');
@@ -404,6 +416,9 @@ let userId = null;
 let allWords = [];
 let learningQueue = [];
 let currentWord = null;
+let currentLearningKind = '';
+let currentLearningOutcome = null;
+let currentLearningPlanRecorded = false;
 let learningSessionActive = false;
 let learningSessionSourceKey = '';
 let challengeWords = [];
@@ -436,6 +451,8 @@ let currentAppSection = 'home';
 let studyTimerId = null;
 let lastStudyInteractionAt = Date.now();
 let lastTrackedMinuteKey = '';
+let learningSettings = createDefaultLearningSettings();
+let learningPlanProgress = createEmptyLearningPlanProgress();
 let readerSettings = createDefaultReaderSettings();
 let aiConfig = createDefaultAiConfig();
 let supabaseClient = null;
@@ -452,6 +469,18 @@ let bootingUserId = null;
 
 function createDefaultReaderSettings() {
     return { ...DEFAULT_READER_SETTINGS };
+}
+
+function createDefaultLearningSettings() {
+    return { ...DEFAULT_LEARNING_SETTINGS };
+}
+
+function createEmptyLearningPlanProgress(dateKey = getDateKey()) {
+    return {
+        dateKey,
+        newWords: [],
+        reviewWords: []
+    };
 }
 
 function createDefaultAiConfig() {
@@ -471,6 +500,9 @@ function resetState() {
     allWords = [];
     learningQueue = [];
     currentWord = null;
+    currentLearningKind = '';
+    currentLearningOutcome = null;
+    currentLearningPlanRecorded = false;
     learningSessionActive = false;
     learningSessionSourceKey = '';
     challengeWords = [];
@@ -480,6 +512,8 @@ function resetState() {
     errata = {};
     studyStats = createEmptyStudyStats();
     userId = null;
+    learningSettings = createDefaultLearningSettings();
+    learningPlanProgress = createEmptyLearningPlanProgress();
     readerSettings = createDefaultReaderSettings();
     aiConfig = createDefaultAiConfig();
     readerBooks = [];
@@ -500,6 +534,8 @@ function getAppStatePayload() {
         knownWords,
         reviewWords,
         errata,
+        learningSettings,
+        learningPlanProgress,
         readerBookTombstones,
         studyStats,
         updatedAt: new Date().toISOString()
@@ -512,6 +548,8 @@ function applyAppStatePayload(data = {}) {
     knownWords = normalized.knownWords;
     reviewWords = normalized.reviewWords;
     errata = normalized.errata;
+    learningSettings = normalized.learningSettings;
+    learningPlanProgress = normalized.learningPlanProgress;
     readerBookTombstones = normalized.readerBookTombstones;
     studyStats = normalized.studyStats;
 }
@@ -947,6 +985,60 @@ function mergeReaderBookTombstones(...sources) {
     return merged;
 }
 
+function clampLearningCount(value, fallback) {
+    const number = Math.round(Number(value));
+    if (!Number.isFinite(number)) return fallback;
+    return Math.min(200, Math.max(0, number));
+}
+
+function normalizeLearningMode(mode) {
+    return LEARNING_MODES.includes(mode) ? mode : DEFAULT_LEARNING_SETTINGS.mode;
+}
+
+function normalizeLearningSettings(raw = {}, sourceUpdatedAt = '') {
+    const base = createDefaultLearningSettings();
+    if (!raw || typeof raw !== 'object') {
+        return { ...base, updatedAt: sourceUpdatedAt || base.updatedAt };
+    }
+    return {
+        newWordsPerDay: clampLearningCount(raw.newWordsPerDay, base.newWordsPerDay),
+        reviewWordsPerDay: clampLearningCount(raw.reviewWordsPerDay, base.reviewWordsPerDay),
+        mode: normalizeLearningMode(raw.mode),
+        updatedAt: raw.updatedAt || sourceUpdatedAt || base.updatedAt
+    };
+}
+
+function mergeLearningSettings(localSettings = {}, cloudSettings = {}, localUpdatedAt = '', cloudUpdatedAt = '') {
+    const local = normalizeLearningSettings(localSettings, localUpdatedAt);
+    const cloud = normalizeLearningSettings(cloudSettings, cloudUpdatedAt);
+    return getTimestampMs(local.updatedAt) >= getTimestampMs(cloud.updatedAt) ? local : cloud;
+}
+
+function normalizeLearningPlanProgress(raw = {}) {
+    const todayKey = getDateKey();
+    if (!raw || typeof raw !== 'object') return createEmptyLearningPlanProgress(todayKey);
+    const dateKey = /^\d{4}-\d{2}-\d{2}$/.test(String(raw.dateKey || '')) ? String(raw.dateKey) : todayKey;
+    if (dateKey !== todayKey) return createEmptyLearningPlanProgress(todayKey);
+    return {
+        dateKey,
+        newWords: uniqueStrings(raw.newWords || []).map(word => word.toLowerCase()),
+        reviewWords: uniqueStrings(raw.reviewWords || []).map(word => word.toLowerCase())
+    };
+}
+
+function mergeLearningPlanProgress(localProgress = {}, cloudProgress = {}) {
+    const local = normalizeLearningPlanProgress(localProgress);
+    const cloud = normalizeLearningPlanProgress(cloudProgress);
+    if (local.dateKey !== cloud.dateKey) {
+        return getTimestampMs(`${local.dateKey}T00:00:00`) >= getTimestampMs(`${cloud.dateKey}T00:00:00`) ? local : cloud;
+    }
+    return {
+        dateKey: local.dateKey,
+        newWords: uniqueStrings([...(cloud.newWords || []), ...(local.newWords || [])]).map(word => word.toLowerCase()),
+        reviewWords: uniqueStrings([...(cloud.reviewWords || []), ...(local.reviewWords || [])]).map(word => word.toLowerCase())
+    };
+}
+
 function recordReaderBookTombstone(bookId, deletedAt = new Date().toISOString()) {
     const id = String(bookId || '').trim();
     if (!id) return false;
@@ -972,6 +1064,8 @@ function normalizeAppStatePayload(data = {}) {
         knownWords: deriveKnownWords(allWords),
         reviewWords: deriveReviewWords(allWords),
         errata: data.errata && typeof data.errata === 'object' ? data.errata : {},
+        learningSettings: normalizeLearningSettings(data.learningSettings, data.updatedAt),
+        learningPlanProgress: normalizeLearningPlanProgress(data.learningPlanProgress),
         readerBookTombstones: normalizeReaderBookTombstones(data.readerBookTombstones),
         studyStats: normalizeStudyStats(data.studyStats),
         updatedAt: data.updatedAt || null
@@ -1042,6 +1136,16 @@ function mergeAppStatePayload(localPayload = {}, cloudPayload = {}) {
         knownWords: deriveKnownWords(allWords),
         reviewWords: deriveReviewWords(allWords),
         errata: mergeErrataPayload(localPayload.errata, cloudPayload.errata),
+        learningSettings: mergeLearningSettings(
+            localPayload.learningSettings,
+            cloudPayload.learningSettings,
+            localPayload.updatedAt,
+            cloudPayload.updatedAt
+        ),
+        learningPlanProgress: mergeLearningPlanProgress(
+            localPayload.learningPlanProgress,
+            cloudPayload.learningPlanProgress
+        ),
         readerBookTombstones,
         studyStats: mergeStudyStats(localPayload.studyStats, cloudPayload.studyStats),
         updatedAt: new Date().toISOString()
@@ -1350,6 +1454,7 @@ async function handleRemoteReaderBookChange(payload) {
 async function refreshUiAfterCloudHydrate() {
     loadReaderSettings();
     updateWordSourceSelector();
+    syncLearningSettingsControls();
     if (!homeView.classList.contains('hidden')) renderHomeDashboard();
     if (!errataView.classList.contains('hidden')) renderErrataView();
     if (!knownListView.classList.contains('hidden')) populateKnownList();
@@ -2043,6 +2148,52 @@ function switchErrataSubView(tab) {
     }
 }
 
+function getLearningMode() {
+    return normalizeLearningMode(learningSettings.mode);
+}
+
+function getLearningModeName(mode = getLearningMode()) {
+    if (mode === 'basic') return '基础模式';
+    if (mode === 'listening') return '听音辨意';
+    return '造句模式';
+}
+
+function syncLearningSettingsControls() {
+    learningSettings = normalizeLearningSettings(learningSettings);
+    learningPlanProgress = normalizeLearningPlanProgress(learningPlanProgress);
+    if (learningNewWordsInput) learningNewWordsInput.value = learningSettings.newWordsPerDay;
+    if (learningReviewWordsInput) learningReviewWordsInput.value = learningSettings.reviewWordsPerDay;
+    if (learningModeSelect) learningModeSelect.value = learningSettings.mode;
+    updateLearningPlanSummary();
+}
+
+function updateLearningPlanSummary() {
+    if (!learningPlanSummary) return;
+    learningPlanProgress = normalizeLearningPlanProgress(learningPlanProgress);
+    const newDone = learningPlanProgress.newWords.length;
+    const reviewDone = learningPlanProgress.reviewWords.length;
+    learningPlanSummary.textContent = `今日计划：新词 ${newDone}/${learningSettings.newWordsPerDay}，复习 ${reviewDone}/${learningSettings.reviewWordsPerDay} · ${getLearningModeName()}`;
+}
+
+function setLearningSettingsPanelOpen(open) {
+    if (!learningSettingsPanel || !learningSettingsToggle) return;
+    learningSettingsPanel.classList.toggle('hidden', !open);
+    learningSettingsToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
+function handleLearningSettingsChange() {
+    learningSettings = normalizeLearningSettings({
+        newWordsPerDay: learningNewWordsInput?.value,
+        reviewWordsPerDay: learningReviewWordsInput?.value,
+        mode: learningModeSelect?.value,
+        updatedAt: new Date().toISOString()
+    });
+    syncLearningSettingsControls();
+    resetLearningSession();
+    saveState({ reason: 'learning-settings' });
+    if (currentAppSection === 'learn') showNextWord();
+}
+
 function updateUiForState(state) {
     // Hide all dynamic elements and actions first
     [wordDetailsEl, sentenceMakerEl, aiFeedbackEl, finishedStateEl, actionsInitial, actionsConfirm, actionsSentence, actionsFinish, actionsRestart, actionsContinueReview].forEach(el => el.classList.add('hidden'));
@@ -2051,9 +2202,10 @@ function updateUiForState(state) {
         case 'initial_load':
             mainWordEl.textContent = '正在初始化...';
             speakBtn.classList.add('hidden');
+            currentLearningOutcome = null;
             break;
         case 'learning':
-            mainWordEl.textContent = currentWord.word;
+            mainWordEl.textContent = getLearningMode() === 'listening' ? '' : currentWord.word;
             speakBtn.classList.remove('hidden');
             actionsInitial.classList.remove('hidden');
             break;
@@ -2061,6 +2213,8 @@ function updateUiForState(state) {
             mainWordEl.textContent = currentWord.word;
             speakBtn.classList.remove('hidden');
             wordDetailsEl.classList.remove('hidden');
+            btnCorrection.textContent = currentLearningOutcome === 'unknown' ? '修正认识' : '修正不认识';
+            btnConfirmKnown.textContent = '下一个';
             actionsConfirm.classList.remove('hidden');
             break;
         case 'make_sentence':
@@ -2083,6 +2237,7 @@ function updateUiForState(state) {
             const sourceName = wordSourceSelector.options[wordSourceSelector.selectedIndex].text;
             mainWordEl.textContent = '';
             speakBtn.classList.add('hidden');
+            currentLearningOutcome = null;
             finishedStateEl.innerHTML = `
                 <p>🎉 词库“${escapeHtml(sourceName)}”已学完！</p>
                 <p style="font-size: 1rem; color: #666; margin-top: 1rem;">是否要重置该词库的全部学习进度并重新开始？</p>
@@ -2093,6 +2248,8 @@ function updateUiForState(state) {
         case 'session_complete':
             mainWordEl.textContent = '';
             speakBtn.classList.add('hidden');
+            currentLearningOutcome = null;
+            updateLearningPlanSummary();
             finishedStateEl.innerHTML = `
                 <p>👍 今日任务已完成！</p>
                 <p style="font-size: 1rem; color: #666; margin-top: 1rem;">是否要继续学习待复习单词？</p>
@@ -2114,6 +2271,51 @@ function resetLearningSession() {
     learningSessionActive = false;
     learningSessionSourceKey = '';
     currentWord = null;
+    currentLearningKind = '';
+    currentLearningOutcome = null;
+    currentLearningPlanRecorded = false;
+}
+
+function getLearningKindForWord(word) {
+    if (!word) return '';
+    return word.status === 'new' ? 'new' : 'review';
+}
+
+function ensureLearningPlanProgressDate() {
+    learningPlanProgress = normalizeLearningPlanProgress(learningPlanProgress);
+    return learningPlanProgress;
+}
+
+function getLearningPlanRemaining(kind) {
+    const progress = ensureLearningPlanProgressDate();
+    if (kind === 'new') {
+        return Math.max(0, learningSettings.newWordsPerDay - progress.newWords.length);
+    }
+    if (kind === 'review') {
+        return Math.max(0, learningSettings.reviewWordsPerDay - progress.reviewWords.length);
+    }
+    return 0;
+}
+
+function filterWordsWithinDailyPlan(words, kind) {
+    const progress = ensureLearningPlanProgressDate();
+    const completed = new Set(kind === 'new' ? progress.newWords : progress.reviewWords);
+    const remaining = getLearningPlanRemaining(kind);
+    if (remaining <= 0) return [];
+    return words
+        .filter(word => !completed.has(word.word))
+        .slice(0, remaining);
+}
+
+function markLearningPlanProgress(kind, word) {
+    if (!kind || !word || currentLearningPlanRecorded) return;
+    const progress = ensureLearningPlanProgressDate();
+    const key = kind === 'new' ? 'newWords' : 'reviewWords';
+    if (!progress[key].includes(word)) {
+        progress[key].push(word);
+    }
+    currentLearningPlanRecorded = true;
+    updateLearningPlanSummary();
 }
 
 function showNextWord() {
@@ -2126,12 +2328,20 @@ function showNextWord() {
 
     if (learningQueue.length > 0) {
         currentWord = learningQueue.shift();
+        currentLearningKind = getLearningKindForWord(currentWord);
+        currentLearningOutcome = null;
+        currentLearningPlanRecorded = false;
         updateUiForState('learning');
         markStudyInteraction();
         prefetchWordDefinition(currentWord.word);
+        if (getLearningMode() === 'listening') {
+            requestAnimationFrame(() => speakWord(currentWord.word));
+        }
     } else {
         learningSessionActive = false;
         currentWord = null;
+        currentLearningKind = '';
+        currentLearningPlanRecorded = false;
         const sourceWords = getCurrentSourceWords();
         const allKnown = sourceWords.every(word => word.status === 'known');
 
@@ -2188,7 +2398,10 @@ function buildLearningQueue(forceAll = false) {
     shuffleArray(wordsToReview);
     shuffleArray(newWords);
 
-    learningQueue = [...wordsToReview, ...newWords.slice(0, NEW_WORDS_PER_SESSION)];
+    learningQueue = [
+        ...filterWordsWithinDailyPlan(wordsToReview, 'review'),
+        ...filterWordsWithinDailyPlan(newWords, 'new')
+    ];
 }
 
 function handleContinueReview() {
@@ -2197,11 +2410,19 @@ function handleContinueReview() {
     learningSessionSourceKey = getLearningSourceKey();
     if (learningQueue.length > 0) {
         currentWord = learningQueue.shift();
+        currentLearningKind = getLearningKindForWord(currentWord);
+        currentLearningOutcome = null;
+        currentLearningPlanRecorded = false;
         updateUiForState('learning');
         prefetchWordDefinition(currentWord.word);
+        if (getLearningMode() === 'listening') {
+            requestAnimationFrame(() => speakWord(currentWord.word));
+        }
     } else {
         learningSessionActive = false;
         currentWord = null;
+        currentLearningKind = '';
+        currentLearningPlanRecorded = false;
         updateUiForState('finished');
     }
 }
@@ -2237,7 +2458,7 @@ async function handleRestartWordList() {
     showNextWord();
 }
 
-function handleKnown() {
+function applyKnownOutcome() {
     const wordIndex = allWords.findIndex(w => w.word === currentWord.word);
     if (wordIndex > -1) {
         touchWordRecord(allWords[wordIndex], {
@@ -2247,12 +2468,9 @@ function handleKnown() {
         });
         addToList('known', currentWord.word);
     }
-    recordStudyEvent({ interactions: 1, wordsKnown: 1, section: 'learn' });
-    loadWordDetails();
-    updateUiForState('show_answer');
 }
 
-function handleUnknown() {
+function applyUnknownOutcome() {
     const wordIndex = allWords.findIndex(w => w.word === currentWord.word);
     if (wordIndex > -1) {
         const nextReviewDate = new Date();
@@ -2264,9 +2482,46 @@ function handleUnknown() {
         });
         addToList('review', currentWord.word);
     }
+}
+
+function handleKnown() {
+    if (!currentWord) return;
+    currentLearningOutcome = 'known';
+    applyKnownOutcome();
+    markLearningPlanProgress(currentLearningKind, currentWord.word);
+    recordStudyEvent({ interactions: 1, wordsKnown: 1, section: 'learn' });
+    loadWordDetails();
+    updateUiForState('show_answer');
+}
+
+function handleUnknown() {
+    if (!currentWord) return;
+    currentLearningOutcome = 'unknown';
+    applyUnknownOutcome();
+    markLearningPlanProgress(currentLearningKind, currentWord.word);
     recordStudyEvent({ interactions: 1, wordsReviewed: 1, section: 'learn' });
     loadWordDetails();
-    updateUiForState('make_sentence');
+    updateUiForState(getLearningMode() === 'sentence' ? 'make_sentence' : 'show_answer');
+}
+
+function handleCorrection() {
+    if (!currentWord || !currentLearningOutcome) return;
+    if (currentLearningOutcome === 'known') {
+        currentLearningOutcome = 'unknown';
+        applyUnknownOutcome();
+        loadWordDetails();
+        if (getLearningMode() === 'sentence') {
+            updateUiForState('make_sentence');
+        } else {
+            updateUiForState('show_answer');
+        }
+    } else {
+        currentLearningOutcome = 'known';
+        applyKnownOutcome();
+        loadWordDetails();
+        updateUiForState('show_answer');
+    }
+    recordStudyEvent({ interactions: 1, section: 'learn' });
 }
 
 async function handleFinishLearning() {
@@ -2369,6 +2624,7 @@ async function initializeApp() {
          }
     }
     updateWordSourceSelector();
+    syncLearningSettingsControls();
     showHomeView();
 }
 
@@ -4831,7 +5087,7 @@ speakBtn.addEventListener('click', () => speakWord(currentWord.word));
 btnKnown.addEventListener('click', handleKnown);
 btnUnknown.addEventListener('click', handleUnknown);
 btnConfirmKnown.addEventListener('click', () => { showNextWord(); });
-btnCorrection.addEventListener('click', handleUnknown);
+btnCorrection.addEventListener('click', handleCorrection);
 
 btnSubmitSentence.addEventListener('click', handleSubmitSentence);
 btnFinishLearning.addEventListener('click', handleFinishLearning);
@@ -4839,6 +5095,15 @@ wordSourceSelector.addEventListener('change', () => {
     resetLearningSession();
     showNextWord();
 });
+learningSettingsToggle.addEventListener('click', () => {
+    const shouldOpen = learningSettingsPanel.classList.contains('hidden');
+    setLearningSettingsPanelOpen(shouldOpen);
+});
+learningNewWordsInput.addEventListener('change', handleLearningSettingsChange);
+learningReviewWordsInput.addEventListener('change', handleLearningSettingsChange);
+learningNewWordsInput.addEventListener('input', handleLearningSettingsChange);
+learningReviewWordsInput.addEventListener('input', handleLearningSettingsChange);
+learningModeSelect.addEventListener('change', handleLearningSettingsChange);
 btnRestartWordlist.addEventListener('click', handleRestartWordList);
 btnContinueReview.addEventListener('click', handleContinueReview);
 

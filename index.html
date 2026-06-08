@@ -650,6 +650,52 @@
             border: 1px solid #ccc;
             font-size: 1rem;
         }
+        .learn-toolbar {
+            display: flex;
+            align-items: end;
+            gap: 0.75rem;
+        }
+        .learn-source-control {
+            flex: 1;
+            min-width: 0;
+        }
+        .learn-settings-btn {
+            border: none;
+            background: #007bff;
+            color: #fff;
+            padding: 0.75rem 1rem;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.95rem;
+            white-space: nowrap;
+        }
+        .learning-settings-panel {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 0.75rem;
+            margin-top: 1rem;
+            text-align: left;
+        }
+        .learning-setting-group label {
+            display: block;
+            font-size: 0.85rem;
+            color: #6c757d;
+            margin-bottom: 0.35rem;
+        }
+        .learning-setting-group input,
+        .learning-setting-group select {
+            width: 100%;
+            padding: 0.7rem;
+            border-radius: 8px;
+            border: 1px solid #ccc;
+            font-size: 1rem;
+        }
+        .learning-plan-summary {
+            grid-column: 1 / -1;
+            margin: 0;
+            color: #6c757d;
+            font-size: 0.88rem;
+        }
         @media (max-width: 640px) {
             .home-choice-view {
                 grid-template-columns: 1fr;
@@ -666,6 +712,13 @@
             }
             .reader-actions button {
                 flex: 1;
+            }
+            .learn-toolbar {
+                align-items: stretch;
+                flex-direction: column;
+            }
+            .learning-settings-panel {
+                grid-template-columns: 1fr;
             }
             .reader-settings {
                 grid-template-columns: 1fr;
@@ -968,6 +1021,46 @@
         #word-source-selector {
             padding: 0.9rem 1rem;
             border-radius: 16px;
+        }
+        .learn-toolbar {
+            align-items: end;
+        }
+        .learn-source-control {
+            min-width: 180px;
+        }
+        .learn-settings-btn {
+            min-height: 50px;
+            border-radius: 16px;
+            background: rgba(255, 255, 255, 0.88);
+            color: var(--text);
+            border: 1px solid var(--border);
+            box-shadow: var(--shadow-sm);
+            font-weight: 650;
+        }
+        .learn-settings-btn[aria-expanded="true"] {
+            background: rgba(10, 132, 255, 0.1);
+            color: var(--accent);
+            border-color: rgba(10, 132, 255, 0.22);
+        }
+        .learning-settings-panel {
+            padding-top: 0.95rem;
+            border-top: 1px solid var(--border);
+        }
+        .learning-setting-group label {
+            color: var(--muted);
+            font-weight: 600;
+        }
+        .learning-setting-group input,
+        .learning-setting-group select {
+            min-height: 46px;
+            border-radius: 14px;
+            border: 1px solid var(--border);
+            background: rgba(255, 255, 255, 0.88);
+            color: var(--text);
+        }
+        .learning-plan-summary {
+            color: var(--muted);
+            line-height: 1.5;
         }
         .mode-switcher,
         .errata-subnav {
@@ -2853,8 +2946,32 @@
             <!-- Learn View (Static Structure) -->
             <div id="learn-view">
                 <div id="word-source-selector-container">
-                    <label for="word-source-selector">当前词库: </label>
-                    <select id="word-source-selector"></select>
+                    <div class="learn-toolbar">
+                        <div class="learn-source-control">
+                            <label for="word-source-selector">当前词库</label>
+                            <select id="word-source-selector"></select>
+                        </div>
+                        <button id="learning-settings-toggle" class="learn-settings-btn" type="button" aria-expanded="false">学习设置</button>
+                    </div>
+                    <div id="learning-settings-panel" class="learning-settings-panel hidden">
+                        <div class="learning-setting-group">
+                            <label for="learning-new-words-per-day">每日新词</label>
+                            <input id="learning-new-words-per-day" type="number" min="0" max="200" step="1">
+                        </div>
+                        <div class="learning-setting-group">
+                            <label for="learning-review-words-per-day">每日复习</label>
+                            <input id="learning-review-words-per-day" type="number" min="0" max="200" step="1">
+                        </div>
+                        <div class="learning-setting-group">
+                            <label for="learning-mode-select">学习模式</label>
+                            <select id="learning-mode-select">
+                                <option value="basic">基础模式</option>
+                                <option value="sentence">造句模式</option>
+                                <option value="listening">听音辨意</option>
+                            </select>
+                        </div>
+                        <p id="learning-plan-summary" class="learning-plan-summary"></p>
+                    </div>
                 </div>
                 <div class="word-card">
                     <div class="word-header">
