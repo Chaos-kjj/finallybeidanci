@@ -246,12 +246,17 @@ const sw = fs.readFileSync(path.join(rootDir, 'sw.js'), 'utf8');
 assert(sw.includes('if (response.ok)'));
 
 const server = fs.readFileSync(path.join(rootDir, 'server.js'), 'utf8');
-assert(server.includes("requestPath === '/api/tts'"));
-assert(server.includes('AZURE_SPEECH_KEY'));
-assert(server.includes('AZURE_TTS_DAILY_CHAR_LIMIT'));
-assert(server.includes("path.join(rootDir, '.cache', 'tts')"));
+assert(!fs.existsSync(path.join(rootDir, 'functions/api/tts.js')));
+assert(!server.includes("requestPath === '/api/tts'"));
+assert(!server.includes('AZURE_SPEECH_KEY'));
+assert(!server.includes("path.join(rootDir, '.cache', 'tts')"));
 assert(appScript.includes("const TTS_AUDIO_CACHE = 'kangkang-tts-audio-v1';"));
-assert(appScript.includes("fetchWithTimeout('/api/tts'"));
+assert(appScript.includes("const FREE_DICTIONARY_API_BASE = 'https://api.dictionaryapi.dev/api/v2/entries/en/';"));
+assert(appScript.includes('function pickDictionaryAudioUrl'));
+assert(appScript.includes('async function fetchDictionaryAudioUrl'));
+assert(appScript.includes('async function fetchDictionaryAudioBlob'));
+assert(appScript.includes("return new Request(`${window.location.origin}/tts-cache/dictionary/"));
+assert(!appScript.includes("fetchWithTimeout('/api/tts'"));
 assert(appScript.includes('fallbackSpeakWord(normalized)'));
 assert(appScript.includes('prefetchLearningQueueAudio();'));
 

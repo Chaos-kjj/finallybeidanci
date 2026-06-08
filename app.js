@@ -17,6 +17,7 @@ const LOCAL_STORAGE_KEY_CLOUD_CLIENT = 'kangkangWordPwa_cloudClientId_v1';
 const LOCAL_STORAGE_KEY_CLOUD_DIRTY = 'kangkangWordPwa_cloudDirty_v1';
 const COLLINS_DICT_BASE_URL = './dict/';
 const COLLINS_DICT_CACHE = 'kangkang-collins-dict-v1';
+const FREE_DICTIONARY_API_BASE = 'https://api.dictionaryapi.dev/api/v2/entries/en/';
 const TTS_AUDIO_CACHE = 'kangkang-tts-audio-v1';
 const READER_DB_NAME = 'kangkangWordPwa_readerDb';
 const READER_DB_VERSION = 1;
@@ -435,7 +436,6 @@ let definitionPrefetches = {};
 let ttsAudioPrefetches = {};
 let ttsAudioUrls = {};
 let currentTtsAudio = null;
-let cloudTtsDisabledUntil = 0;
 let collinsManifestPromise = null;
 let collinsShardMemory = {};
 let readerDb = null;
@@ -2967,7 +2967,7 @@ async function fetchServerDefinition(word) {
 }
 
 async function fetchEnglishDictionaryDefinition(word) {
-    const response = await fetchWithTimeout(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(word)}`, {}, 3500);
+    const response = await fetchWithTimeout(`${FREE_DICTIONARY_API_BASE}${encodeURIComponent(word)}`, {}, 3500);
     if (!response.ok) {
         throw new Error('免费英英词典没有查到释义');
     }
@@ -3188,7 +3188,7 @@ function normalizeTtsWord(word) {
 }
 
 function getTtsCacheRequest(word) {
-    return new Request(`${window.location.origin}/api/tts-cache/${encodeURIComponent(normalizeTtsWord(word))}`);
+    return new Request(`${window.location.origin}/tts-cache/dictionary/${encodeURIComponent(normalizeTtsWord(word))}`);
 }
 
 async function getCachedTtsBlob(word) {
@@ -3206,61 +3206,82 @@ async function setCachedTtsBlob(word, blob) {
     }));
 }
 
-function isCloudTtsTemporarilyDisabled() {
-    return Date.now() < cloudTtsDisabledUntil;
+function normalizeDictionaryAudioUrl(url) {
+    const rawUrl = String(url || '').trim();
+    if (!rawUrl) return '';
+    if (rawUrl.startsWith('//')) return `https:${rawUrl}`;
+    return rawUrl;
 }
 
-function markCloudTtsTemporarilyDisabled(durationMs = 300000) {
-    cloudTtsDisabledUntil = Date.now() + durationMs;
+function pickDictionaryAudioUrl(entries) {
+    const urls = (Array.isArray(entries) ? entries : [])
+        .flatMap(entry => Array.isArray(entry?.phonetics) ? entry.phonetics : [])
+        .map(item => normalizeDictionaryAudioUrl(item?.audio))
+        .filter(Boolean);
+    return urls.find(url => /(?:_|-)us(?:_|-|\.|\/)/i.test(url))
+        || urls.find(url => /\.mp3(?:\?|$)/i.test(url))
+        || urls[0]
+        || '';
 }
 
-async function fetchCloudTtsBlob(word, options = {}) {
+async function fetchDictionaryAudioUrl(word, timeoutMs = TTS_CLICK_TIMEOUT_MS) {
     const normalized = normalizeTtsWord(word);
     if (!normalized) throw new Error('没有可朗读的单词');
 
-    const cached = await getCachedTtsBlob(normalized);
-    if (cached) return cached;
-    if (isCloudTtsTemporarilyDisabled()) {
-        throw new Error('云端 TTS 暂时不可用');
-    }
-
-    const response = await fetchWithTimeout('/api/tts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: normalized })
-    }, options.timeoutMs || TTS_CLICK_TIMEOUT_MS);
-
+    const response = await fetchWithTimeout(`${FREE_DICTIONARY_API_BASE}${encodeURIComponent(normalized)}`, {}, timeoutMs);
     if (!response.ok) {
-        let message = `TTS 服务不可用：${response.status}`;
-        try {
-            const payload = await response.json();
-            if (payload?.error) message = payload.error;
-        } catch {
-            // Keep the generic message.
-        }
-        if ([404, 429, 502, 503].includes(response.status)) {
-            markCloudTtsTemporarilyDisabled(response.status === 429 ? 3600000 : 300000);
-        }
-        throw new Error(message);
+        throw new Error(`免费词典没有发音：${response.status}`);
     }
 
+    const audioUrl = pickDictionaryAudioUrl(await response.json());
+    if (!audioUrl) {
+        throw new Error('免费词典没有返回发音音频');
+    }
+
+    return audioUrl;
+}
+
+async function fetchDictionaryAudioBlob(audioUrl, timeoutMs = TTS_CLICK_TIMEOUT_MS) {
+    const response = await fetchWithTimeout(audioUrl, {}, timeoutMs);
+    if (!response.ok) {
+        throw new Error(`词典发音音频不可用：${response.status}`);
+    }
     const blob = await response.blob();
-    await setCachedTtsBlob(normalized, blob);
+    if (!blob || blob.size === 0) {
+        throw new Error('词典发音音频为空');
+    }
     return blob;
 }
 
 async function getTtsAudioUrl(word, options = {}) {
     const normalized = normalizeTtsWord(word);
+    if (!normalized) throw new Error('没有可朗读的单词');
     if (ttsAudioUrls[normalized]) return ttsAudioUrls[normalized];
-    const blob = await fetchCloudTtsBlob(normalized, options);
-    const url = URL.createObjectURL(blob);
-    ttsAudioUrls[normalized] = url;
-    return url;
+
+    const cached = await getCachedTtsBlob(normalized);
+    if (cached) {
+        const cachedUrl = URL.createObjectURL(cached);
+        ttsAudioUrls[normalized] = cachedUrl;
+        return cachedUrl;
+    }
+
+    const timeoutMs = options.timeoutMs || TTS_CLICK_TIMEOUT_MS;
+    const dictionaryUrl = await fetchDictionaryAudioUrl(normalized, timeoutMs);
+    try {
+        const blob = await fetchDictionaryAudioBlob(dictionaryUrl, timeoutMs);
+        await setCachedTtsBlob(normalized, blob);
+        const url = URL.createObjectURL(blob);
+        ttsAudioUrls[normalized] = url;
+        return url;
+    } catch (error) {
+        console.warn(`词典发音缓存失败，直接播放音频地址: ${normalized}`, error.message || error);
+        ttsAudioUrls[normalized] = dictionaryUrl;
+        return dictionaryUrl;
+    }
 }
 
 function prefetchWordAudio(word) {
     const normalized = normalizeTtsWord(word);
-    if (isCloudTtsTemporarilyDisabled()) return;
     if (!normalized || ttsAudioUrls[normalized] || ttsAudioPrefetches[normalized]) return;
     ttsAudioPrefetches[normalized] = getTtsAudioUrl(normalized, { timeoutMs: TTS_PREFETCH_TIMEOUT_MS })
         .catch(error => console.warn(`预取发音失败: ${normalized}`, error.message || error))
@@ -5422,7 +5443,7 @@ function stopCurrentTtsAudio() {
     }
 }
 
-async function playCloudTtsWord(text) {
+async function playDictionaryTtsWord(text) {
     const normalized = normalizeTtsWord(text);
     const url = await getTtsAudioUrl(normalized, { timeoutMs: TTS_CLICK_TIMEOUT_MS });
     stopCurrentTtsAudio();
@@ -5434,8 +5455,8 @@ async function playCloudTtsWord(text) {
 function speakWord(text) {
     const normalized = normalizeTtsWord(text);
     if (!normalized) return;
-    playCloudTtsWord(normalized).catch(error => {
-        console.warn('云端发音不可用，使用浏览器发音:', error.message || error);
+    playDictionaryTtsWord(normalized).catch(error => {
+        console.warn('词典发音不可用，使用浏览器发音:', error.message || error);
         stopCurrentTtsAudio();
         fallbackSpeakWord(normalized);
     });
