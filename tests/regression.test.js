@@ -132,6 +132,25 @@ assert(appScript.includes('if (isReaderBookDeleted(book)) return;'));
 assert(appScript.includes('DEFAULT_WORD_LIST_FALLBACK'));
 assert(appScript.includes('默认词库加载失败，使用内置兜底词库'));
 
+const readerBackHandlerMatch = appScript.match(/readerBackHomeBtn\.addEventListener\('click', \(\) => \{([\s\S]*?)\n\}\);/);
+assert(readerBackHandlerMatch, 'reader back-home handler should be present');
+const readerBackHandler = readerBackHandlerMatch[1];
+assert(readerBackHandler.includes('showHomeView();'));
+assert(readerBackHandler.includes('flushAllPendingSyncInBackground'));
+assert(
+  readerBackHandler.indexOf('showHomeView();') < readerBackHandler.indexOf('flushAllPendingSyncInBackground'),
+  'reader back-home should show home before background sync'
+);
+assert(!readerBackHandler.includes('await flushAllPendingSync'));
+
+const progressPersistStart = appScript.indexOf('async function persistReaderProgress');
+const progressPersistEnd = appScript.indexOf('async function flushAllPendingSync', progressPersistStart);
+assert(progressPersistStart > -1 && progressPersistEnd > progressPersistStart, 'progress persist helper should be extractable');
+const progressPersistBlock = appScript.slice(progressPersistStart, progressPersistEnd);
+assert(progressPersistBlock.includes('writeBook = false'));
+assert(progressPersistBlock.includes('if (writeBook)'));
+assert(!progressPersistBlock.includes('await saveBook(currentReaderBook'));
+
 const sw = fs.readFileSync(path.join(rootDir, 'sw.js'), 'utf8');
 assert(sw.includes('if (response.ok)'));
 

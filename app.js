@@ -3210,9 +3210,11 @@ function renderReaderBook(book) {
         highlightedOccurrences: Array.isArray(book.highlightedOccurrences) ? book.highlightedOccurrences : [],
         notes: normalizeReaderNotes(book.notes)
     };
-    readerSettings.lastBookId = currentReaderBook.id;
-    saveReaderSettings();
-    saveReaderProgressLocally(currentReaderBook, savedProgress);
+    if (readerSettings.lastBookId !== currentReaderBook.id) {
+        readerSettings.lastBookId = currentReaderBook.id;
+        saveReaderSettings();
+    }
+    saveReaderProgressLocally(currentReaderBook, savedProgress, { syncCloud: false });
     readerEmpty.classList.add('hidden');
     readerBookTitle.classList.remove('hidden');
     readerBookTitle.textContent = book.title;
@@ -3593,6 +3595,17 @@ function updateReaderProgressDisplay() {
     }
 }
 
+function captureCurrentReaderProgress(updatedAt = new Date().toISOString()) {
+    if (!currentReaderBook) return null;
+    return {
+        flow: readerSettings.flow || 'scroll',
+        scrollTop: Math.max(0, Math.round(readerStage.scrollTop || 0)),
+        pageIndex: currentReaderPageIndex,
+        percent: getReaderProgressPercent(),
+        updatedAt
+    };
+}
+
 function restoreReaderProgress() {
     if (!currentReaderBook) {
         updateReaderProgressDisplay();
@@ -3650,8 +3663,16 @@ function scheduleReaderProgressSave() {
 }
 
 async function persistReaderProgress(options = {}) {
-    const { syncCloud = true, flushCloud = false, reason = 'reader-progress' } = options;
-    if (!currentReaderBook) return;
+    const {
+        syncCloud = true,
+        flushCloud = false,
+        reason = 'reader-progress',
+        book = currentReaderBook,
+        progress: capturedProgress = null,
+        writeBook = false
+    } = options;
+    const targetBook = book || currentReaderBook;
+    if (!targetBook) return;
     if (readerProgressSaveTimer) {
         clearTimeout(readerProgressSaveTimer);
         readerProgressSaveTimer = null;
@@ -3661,26 +3682,28 @@ async function persistReaderProgress(options = {}) {
         readerProgressThrottleTimer = null;
     }
     const now = new Date().toISOString();
-    const progress = {
-        flow: readerSettings.flow || 'scroll',
-        scrollTop: Math.max(0, Math.round(readerStage.scrollTop || 0)),
-        pageIndex: currentReaderPageIndex,
-        percent: getReaderProgressPercent(),
-        updatedAt: now
-    };
-    currentReaderBook = { ...currentReaderBook, progress, updatedAt: Date.now() };
+    const progress = capturedProgress
+        ? normalizeReaderProgress({ ...capturedProgress, updatedAt: capturedProgress.updatedAt || now })
+        : captureCurrentReaderProgress(now);
+    if (!progress) return;
+    const nextBook = { ...targetBook, progress, updatedAt: Date.now() };
+    if (currentReaderBook?.id === nextBook.id) {
+        currentReaderBook = { ...currentReaderBook, ...nextBook };
+    }
     lastReaderProgressPersistAt = Date.now();
-    saveReaderProgressLocally(currentReaderBook, progress, { syncCloud, reason });
-    const index = readerBooks.findIndex(book => book.id === currentReaderBook.id);
-    if (index > -1) readerBooks[index] = currentReaderBook;
-    await saveBook(currentReaderBook, { syncCloud: false });
+    saveReaderProgressLocally(nextBook, progress, { syncCloud, reason });
+    const index = readerBooks.findIndex(item => item.id === nextBook.id);
+    if (index > -1) readerBooks[index] = nextBook;
+    if (writeBook) {
+        await saveBook(nextBook, { syncCloud: false });
+    }
     if (flushCloud) await flushCloudSync(reason);
 }
 
 async function flushAllPendingSync(reason = 'flush', options = {}) {
-    const { includeReaderBooks = false, keepalive = false } = options;
-    if (currentReaderBook) {
-        await persistReaderProgress({ syncCloud: false, reason });
+    const { includeReaderBooks = false, keepalive = false, book = currentReaderBook, progress = null } = options;
+    if (book) {
+        await persistReaderProgress({ syncCloud: false, reason, book, progress });
     }
     if (includeReaderBooks) {
         await syncAllReaderBooksToCloud();
@@ -3690,6 +3713,13 @@ async function flushAllPendingSync(reason = 'flush', options = {}) {
         return true;
     }
     return flushCloudSync(reason);
+}
+
+function flushAllPendingSyncInBackground(reason = 'background-flush', options = {}) {
+    flushAllPendingSync(reason, options).catch(error => {
+        console.warn('Background sync failed:', error);
+        setCloudSyncStatus(`后台同步失败：${error.message}`, true);
+    });
 }
 
 function goReaderPage(delta) {
@@ -4825,16 +4855,22 @@ readerControlsToggle.addEventListener('click', () => {
     if (shouldOpen) updateReaderProgressDisplay();
     markStudyInteraction();
 });
-readerBackHomeBtn.addEventListener('click', async () => {
-    await flushAllPendingSync('reader-back-home');
+readerBackHomeBtn.addEventListener('click', () => {
+    const book = currentReaderBook;
+    const progress = captureCurrentReaderProgress();
     showHomeView();
+    flushAllPendingSyncInBackground('reader-back-home', { book, progress });
 });
-readerBookSelector.addEventListener('change', async () => {
-    await persistReaderProgress({ syncCloud: false, reason: 'reader-switch-book' });
-    await flushCloudSync('reader-switch-book');
+readerBookSelector.addEventListener('change', () => {
+    const previousBook = currentReaderBook;
+    const previousProgress = captureCurrentReaderProgress();
     const book = readerBooks.find(item => item.id === readerBookSelector.value);
     if (book) renderReaderBook(book);
     else renderReaderEmpty();
+    flushAllPendingSyncInBackground('reader-switch-book', {
+        book: previousBook,
+        progress: previousProgress
+    });
 });
 readerFileInput.addEventListener('change', () => handleReaderFile(readerFileInput.files[0]));
 readerSettingsToggle.addEventListener('click', () => readerSettingsPanel.classList.toggle('hidden'));
@@ -5088,4 +5124,3 @@ initializeAuth().catch(error => {
     console.error('Auth initialization failed:', error);
     showLoginForm(`初始化失败：${error.message}`);
 });
-
