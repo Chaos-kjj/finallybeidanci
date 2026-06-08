@@ -139,6 +139,7 @@ function updateUiForState(state) { states.push({ state, word: currentWord?.word 
 function updateLearningPlanSummary() {}
 function markStudyInteraction() {}
 function prefetchWordDefinition() {}
+function prefetchLearningQueueAudio() {}
 function shuffleArray() {}
 ${appScript.slice(learningStart, learningEnd)}
 for (let index = 0; index < 11; index += 1) {
@@ -201,6 +202,7 @@ function updateUiForState(state) { states.push({ state, word: currentWord?.word 
 function updateLearningPlanSummary() {}
 function markStudyInteraction() {}
 function prefetchWordDefinition() {}
+function prefetchLearningQueueAudio() {}
 function shuffleArray() {}
 ${appScript.slice(learningStart, learningEnd)}
 for (let index = 0; index < 4; index += 1) {
@@ -242,6 +244,16 @@ assert(!progressPersistBlock.includes('await saveBook(currentReaderBook'));
 
 const sw = fs.readFileSync(path.join(rootDir, 'sw.js'), 'utf8');
 assert(sw.includes('if (response.ok)'));
+
+const server = fs.readFileSync(path.join(rootDir, 'server.js'), 'utf8');
+assert(server.includes("requestPath === '/api/tts'"));
+assert(server.includes('AZURE_SPEECH_KEY'));
+assert(server.includes('AZURE_TTS_DAILY_CHAR_LIMIT'));
+assert(server.includes("path.join(rootDir, '.cache', 'tts')"));
+assert(appScript.includes("const TTS_AUDIO_CACHE = 'kangkang-tts-audio-v1';"));
+assert(appScript.includes("fetchWithTimeout('/api/tts'"));
+assert(appScript.includes('fallbackSpeakWord(normalized)'));
+assert(appScript.includes('prefetchLearningQueueAudio();'));
 
 const manifest = JSON.parse(fs.readFileSync(path.join(rootDir, 'manifest.webmanifest'), 'utf8'));
 assert.equal(manifest.name, '康康背词器');

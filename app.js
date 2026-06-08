@@ -17,6 +17,7 @@ const LOCAL_STORAGE_KEY_CLOUD_CLIENT = 'kangkangWordPwa_cloudClientId_v1';
 const LOCAL_STORAGE_KEY_CLOUD_DIRTY = 'kangkangWordPwa_cloudDirty_v1';
 const COLLINS_DICT_BASE_URL = './dict/';
 const COLLINS_DICT_CACHE = 'kangkang-collins-dict-v1';
+const TTS_AUDIO_CACHE = 'kangkang-tts-audio-v1';
 const READER_DB_NAME = 'kangkangWordPwa_readerDb';
 const READER_DB_VERSION = 1;
 const READER_BOOK_STORE = 'books';
@@ -32,6 +33,9 @@ const CLOUD_SYNC_CLIENT_ID = getOrCreateCloudClientId();
 const CLOUD_SYNC_DEBOUNCE_MS = 900;
 const READER_PROGRESS_SAVE_DEBOUNCE_MS = 650;
 const READER_PROGRESS_SAVE_THROTTLE_MS = 5000;
+const TTS_WORD_PREFETCH_LIMIT = 4;
+const TTS_CLICK_TIMEOUT_MS = 1500;
+const TTS_PREFETCH_TIMEOUT_MS = 6500;
 
 const DEFAULT_READER_SETTINGS = Object.freeze({
     font: 'Georgia, serif',
@@ -428,6 +432,10 @@ let reviewWords = [];
 let errata = {};
 let studyStats = createEmptyStudyStats();
 let definitionPrefetches = {};
+let ttsAudioPrefetches = {};
+let ttsAudioUrls = {};
+let currentTtsAudio = null;
+let cloudTtsDisabledUntil = 0;
 let collinsManifestPromise = null;
 let collinsShardMemory = {};
 let readerDb = null;
@@ -511,6 +519,8 @@ function resetState() {
     reviewWords = [];
     errata = {};
     studyStats = createEmptyStudyStats();
+    definitionPrefetches = {};
+    ttsAudioPrefetches = {};
     userId = null;
     learningSettings = createDefaultLearningSettings();
     learningPlanProgress = createEmptyLearningPlanProgress();
@@ -2334,6 +2344,7 @@ function showNextWord() {
         updateUiForState('learning');
         markStudyInteraction();
         prefetchWordDefinition(currentWord.word);
+        prefetchLearningQueueAudio();
         if (getLearningMode() === 'listening') {
             requestAnimationFrame(() => speakWord(currentWord.word));
         }
@@ -2415,6 +2426,7 @@ function handleContinueReview() {
         currentLearningPlanRecorded = false;
         updateUiForState('learning');
         prefetchWordDefinition(currentWord.word);
+        prefetchLearningQueueAudio();
         if (getLearningMode() === 'listening') {
             requestAnimationFrame(() => speakWord(currentWord.word));
         }
@@ -3165,6 +3177,103 @@ function prefetchWordDefinition(word) {
         .finally(() => {
             delete definitionPrefetches[word];
         });
+}
+
+function normalizeTtsWord(word) {
+    return String(word || '')
+        .normalize('NFKC')
+        .toLowerCase()
+        .replace(/^[^a-z]+|[^a-z]+$/g, '')
+        .trim();
+}
+
+function getTtsCacheRequest(word) {
+    return new Request(`${window.location.origin}/api/tts-cache/${encodeURIComponent(normalizeTtsWord(word))}`);
+}
+
+async function getCachedTtsBlob(word) {
+    if (!('caches' in window)) return null;
+    const cache = await caches.open(TTS_AUDIO_CACHE);
+    const response = await cache.match(getTtsCacheRequest(word));
+    return response ? response.blob() : null;
+}
+
+async function setCachedTtsBlob(word, blob) {
+    if (!('caches' in window) || !blob) return;
+    const cache = await caches.open(TTS_AUDIO_CACHE);
+    await cache.put(getTtsCacheRequest(word), new Response(blob, {
+        headers: { 'Content-Type': blob.type || 'audio/mpeg' }
+    }));
+}
+
+function isCloudTtsTemporarilyDisabled() {
+    return Date.now() < cloudTtsDisabledUntil;
+}
+
+function markCloudTtsTemporarilyDisabled(durationMs = 300000) {
+    cloudTtsDisabledUntil = Date.now() + durationMs;
+}
+
+async function fetchCloudTtsBlob(word, options = {}) {
+    const normalized = normalizeTtsWord(word);
+    if (!normalized) throw new Error('没有可朗读的单词');
+
+    const cached = await getCachedTtsBlob(normalized);
+    if (cached) return cached;
+    if (isCloudTtsTemporarilyDisabled()) {
+        throw new Error('云端 TTS 暂时不可用');
+    }
+
+    const response = await fetchWithTimeout('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: normalized })
+    }, options.timeoutMs || TTS_CLICK_TIMEOUT_MS);
+
+    if (!response.ok) {
+        let message = `TTS 服务不可用：${response.status}`;
+        try {
+            const payload = await response.json();
+            if (payload?.error) message = payload.error;
+        } catch {
+            // Keep the generic message.
+        }
+        if ([404, 429, 502, 503].includes(response.status)) {
+            markCloudTtsTemporarilyDisabled(response.status === 429 ? 3600000 : 300000);
+        }
+        throw new Error(message);
+    }
+
+    const blob = await response.blob();
+    await setCachedTtsBlob(normalized, blob);
+    return blob;
+}
+
+async function getTtsAudioUrl(word, options = {}) {
+    const normalized = normalizeTtsWord(word);
+    if (ttsAudioUrls[normalized]) return ttsAudioUrls[normalized];
+    const blob = await fetchCloudTtsBlob(normalized, options);
+    const url = URL.createObjectURL(blob);
+    ttsAudioUrls[normalized] = url;
+    return url;
+}
+
+function prefetchWordAudio(word) {
+    const normalized = normalizeTtsWord(word);
+    if (isCloudTtsTemporarilyDisabled()) return;
+    if (!normalized || ttsAudioUrls[normalized] || ttsAudioPrefetches[normalized]) return;
+    ttsAudioPrefetches[normalized] = getTtsAudioUrl(normalized, { timeoutMs: TTS_PREFETCH_TIMEOUT_MS })
+        .catch(error => console.warn(`预取发音失败: ${normalized}`, error.message || error))
+        .finally(() => {
+            delete ttsAudioPrefetches[normalized];
+        });
+}
+
+function prefetchLearningQueueAudio() {
+    const words = [currentWord, ...learningQueue.slice(0, Math.max(0, TTS_WORD_PREFETCH_LIMIT - 1))]
+        .map(item => item?.word)
+        .filter(Boolean);
+    words.forEach(prefetchWordAudio);
 }
 
 function loadReaderProgressStorage() {
@@ -5082,7 +5191,7 @@ saveAiSettingsBtn.addEventListener('click', () => {
     aiSettingsModal.classList.add('hidden');
     alert('AI设置已保存！');
 });
-speakBtn.addEventListener('click', () => speakWord(currentWord.word));
+speakBtn.addEventListener('click', () => speakWord(currentWord?.word));
 
 btnKnown.addEventListener('click', handleKnown);
 btnUnknown.addEventListener('click', handleUnknown);
@@ -5291,7 +5400,46 @@ window.addEventListener('beforeunload', () => {
 
 // --- Helper & Utility Functions ---
 function shuffleArray(array) { for (let i = array.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1));[array[i], array[j]] = [array[j], array[i]]; } }
-function speakWord(text) { if ('speechSynthesis' in window && text) { window.speechSynthesis.cancel(); const utterance = new SpeechSynthesisUtterance(text); utterance.lang = 'en-US'; utterance.rate = 0.9; window.speechSynthesis.speak(utterance); } }
+
+function fallbackSpeakWord(text) {
+    if ('speechSynthesis' in window && text) {
+        window.speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.lang = 'en-US';
+        utterance.rate = 0.9;
+        window.speechSynthesis.speak(utterance);
+    }
+}
+
+function stopCurrentTtsAudio() {
+    if (currentTtsAudio) {
+        currentTtsAudio.pause();
+        currentTtsAudio.currentTime = 0;
+        currentTtsAudio = null;
+    }
+    if ('speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+    }
+}
+
+async function playCloudTtsWord(text) {
+    const normalized = normalizeTtsWord(text);
+    const url = await getTtsAudioUrl(normalized, { timeoutMs: TTS_CLICK_TIMEOUT_MS });
+    stopCurrentTtsAudio();
+    const audio = new Audio(url);
+    currentTtsAudio = audio;
+    await audio.play();
+}
+
+function speakWord(text) {
+    const normalized = normalizeTtsWord(text);
+    if (!normalized) return;
+    playCloudTtsWord(normalized).catch(error => {
+        console.warn('云端发音不可用，使用浏览器发音:', error.message || error);
+        stopCurrentTtsAudio();
+        fallbackSpeakWord(normalized);
+    });
+}
 
 async function loadWordDetails() {
     const word = currentWord.word;
