@@ -5,6 +5,7 @@
     }
     if (root) {
         root.parseEpubToText = api.parseEpubToText;
+        root.parseEpubBook = api.parseEpubBook;
     }
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
     const UTF8_FLAG = 0x0800;
@@ -55,6 +56,77 @@
         }
 
         return chapterTexts.join('\n\n');
+    }
+
+    async function parseEpubBook(arrayBuffer, options = {}) {
+        const zip = await readZipEntries(arrayBuffer);
+        const containerXml = await zip.getText('META-INF/container.xml');
+        if (!containerXml) throw new Error('EPUB 缺少 META-INF/container.xml');
+        const packagePath = getContainerPackagePath(containerXml);
+        if (!packagePath) throw new Error('EPUB 未声明 OPF package 文件');
+        const packageXml = await zip.getText(packagePath);
+        if (!packageXml) throw new Error('EPUB 缺少 OPF package 文件');
+
+        const packageDir = getDirectory(packagePath);
+        const manifest = parseManifest(packageXml, packageDir);
+        const spine = parseSpine(packageXml);
+        const labels = await parseChapterLabels(zip, manifest);
+        const metadata = parsePackageMetadata(packageXml);
+        const chapters = [];
+
+        for (let index = 0; index < spine.length; index += 1) {
+            const spineItem = spine[index];
+            if (spineItem.linear === 'no') continue;
+            const item = manifest.byId.get(spineItem.idref);
+            if (!item || !isHtmlManifestItem(item) || isSkippableEpubItem(item)) continue;
+            const html = await zip.getText(item.path);
+            if (!html) continue;
+            const safeHtml = sanitizeEpubHtml(html, options.maxChapterBytes || 2_000_000);
+            const text = htmlToReadableText(safeHtml);
+            if (!text) continue;
+            chapters.push({
+                id: item.id,
+                href: item.path,
+                title: labels.get(item.path) || item.title || `第 ${chapters.length + 1} 章`,
+                html: safeHtml,
+                text,
+                spineIndex: index
+            });
+        }
+
+        if (!chapters.length) throw new Error('EPUB 没有找到可阅读正文');
+        return {
+            title: metadata.title || options.title || '',
+            author: metadata.author || '',
+            language: metadata.language || '',
+            chapters,
+            toc: chapters.map((chapter, index) => ({ id: chapter.id, title: chapter.title, chapterIndex: index, href: chapter.href }))
+        };
+    }
+
+    function parsePackageMetadata(packageXml) {
+        const values = {};
+        ['title', 'creator', 'language', 'identifier'].forEach(name => {
+            const match = packageXml.match(new RegExp(`<[^:>\\s]*:?${name}\\b[^>]*>([\\s\\S]*?)<\\/[^:>\\s]*:?${name}>`, 'i'));
+            if (match) values[name === 'creator' ? 'author' : name] = decodeHtmlEntities(stripTags(match[1])).trim();
+        });
+        return values;
+    }
+
+    function sanitizeEpubHtml(html, maxBytes) {
+        let safe = String(html || '').slice(0, maxBytes);
+        safe = safe
+            .replace(/<!--[\s\S]*?-->/g, '')
+            .replace(/<\s*(script|style|iframe|object|embed|form|audio|video)\b[^>]*>[\s\S]*?<\/\s*\1\s*>/gi, '')
+            .replace(/<\s*(?:script|style|iframe|object|embed|form|base|meta|link|audio|video|source|track)\b[^>]*\/?>/gi, '')
+            .replace(/<\/\s*(?:script|style|iframe|object|embed|form|base|meta|link|audio|video|source|track)\s*>/gi, '')
+            .replace(/\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+            .replace(/\s(?:src|href)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, match => {
+                return /(?:blob:|data:image\/(?:png|jpeg|gif|webp);base64:|app-dict:)/i.test(match) ? match : '';
+            })
+            .replace(/javascript\s*:/gi, '')
+            .slice(0, maxBytes);
+        return safe;
     }
 
     async function readZipEntries(arrayBuffer) {
@@ -412,6 +484,7 @@
 
     return {
         parseEpubToText,
+        parseEpubBook,
         htmlToReadableText
     };
 });

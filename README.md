@@ -1,82 +1,101 @@
-# Cloudflare Pages + Supabase 部署说明
+# 康康背词器：Android 墨水屏本机版
 
-这个目录是可公开部署的前端静态版本。用户账户、背词记录、阅读书库、阅读进度、阅读设置、AI 设置和学习统计会通过 Supabase 同步。
+这是一个离线优先的 Capacitor Android 应用，目标设备为 Bigme B7 Pro（Android 14、7 英寸电子墨水屏）。学习数据、书籍、阅读进度、笔记、书签、设置、词典索引和 AI 缓存保存在应用私有存储中；项目不再使用 Supabase Auth、Postgres、Realtime、远程词库或 CDN 才能启动。
 
-## 需要注册的服务
+## 环境
 
-1. Supabase：用于 Auth 登录注册、Postgres 云端数据表、Realtime 多设备更新。
-2. Cloudflare Pages：用于托管这个静态 PWA。
-3. SiliconFlow：可选，仅用于页面右上角 AI 设置里的释义、造句批改、翻译挑战。
+- Node.js 18+、npm
+- JDK 21（Capacitor 7 的 Android 编译要求）
+- Android SDK Platform 35 和 Build Tools 35
+- Android Studio 可选；命令行构建不依赖 Android Studio
 
-## Supabase 初始化
+applicationId 保持为 `com.kangkang.beidanci`。升级安装需要使用同一签名；仓库没有提交任何 release keystore。
 
-1. 在 Supabase 新建项目。
-2. 打开 SQL Editor，执行 `supabase-schema.sql`。
-3. 在 Authentication > Providers 确认 Email 登录已启用。
-4. 如果保留邮箱验证，请在 Authentication > URL Configuration 里添加你的 Cloudflare Pages 域名作为 Site URL 或 Redirect URL。
-5. `supabase-schema.sql` 会开启 RLS，并把 `user_app_state` 和 `user_reader_books` 加入 `supabase_realtime` publication，用于同账号多设备更新。
-
-## Cloudflare Pages 设置
-
-如果你把整个项目上传到 GitHub，并让 Cloudflare 从项目根目录构建：
-
-- Framework preset: `None`
-- Build command: `node deploy/build-config.js`
-- Output directory: `deploy`
-- Environment variables:
-  - `KANGKANG_SUPABASE_URL`
-  - `KANGKANG_SUPABASE_ANON_KEY`
-
-如果 GitHub 仓库根目录就是本 `deploy` 目录：
-
-- Framework preset: `None`
-- Build command: `node build-config.js`
-- Output directory: `/`
-- Environment variables:
-  - `KANGKANG_SUPABASE_URL`
-  - `KANGKANG_SUPABASE_ANON_KEY`
-
-可选环境变量：
-
-- `KANGKANG_SUPABASE_STATE_TABLE`：默认 `user_app_state`，通常不用改。
-- `KANGKANG_SUPABASE_READER_BOOKS_TABLE`：默认 `user_reader_books`，通常不用改。
-
-## 本地运行
-
-根目录执行：
+## 开发、测试和构建
 
 ```bash
-npm start
+npm install
+npm run dev                 # Vite 本地预览
+npm test                    # 原有回归入口
+npm run test:all            # 全部 Node 测试
+npm run lint:offline        # 运行时离线/远程依赖扫描
+npm run build               # 生成 dist，并复制本地词典、图标和 Service Worker
+npx cap sync android
 ```
 
-当前 `server.js` 会托管根目录静态文件，默认地址是 `http://127.0.0.1:3000`。如需更换端口：
+Android debug 构建：
 
 ```bash
-PORT=3001 npm start
+cd android
+./gradlew assembleDebug
 ```
 
-本地要测试云端同步时，可以直接编辑根目录 `supabase-config.js`，填入 Supabase Project URL 和 anon key。anon key 是浏览器端公开 key，不要填写 service role key。
+本次构建得到的 APK：
 
-## 免费免注册发音
+`android/app/build/outputs/apk/debug/app-debug.apk`
 
-英文单词发音默认走 Free Dictionary API 的词典音频，不需要注册账户，也不需要在 Cloudflare 或本地配置任何发音密钥。
+APK 只使用 debug 签名，适合侧载和验收，不适合发布。侧载示例：
 
-发音流程：
+```bash
+adb install -r android/app/build/outputs/apk/debug/app-debug.apk
+```
 
-- 点击或学习页预取时，前端请求 `https://api.dictionaryapi.dev/api/v2/entries/en/<word>`。
-- 如果返回 `phonetics[].audio`，优先播放带美式标记的音频，其次播放可用 MP3。
-- 音频会缓存在当前浏览器的 Cache API 里，同一个设备第二次播放会更快。
-- 少数词没有词典音频、网络失败或第三方接口暂时不可用时，会自动回退到浏览器自带英文发音。
+正式发布时请在 Android Studio 或 Gradle 的 `signingConfigs.release` 中配置用户自己的签名证书；不要把 keystore、密码或 API Key 放进仓库。
 
-## 数据同步范围
+## 本地数据和旧版本迁移
 
-登录后会同步：
+新数据库为 IndexedDB `kangkang-local-db`，schema version 3，包含状态、书籍、标注、词典、索引、原文件和 AI 缓存，并带版本升级路径。首次打开会迁移旧版 `localStorage` 状态、阅读设置/进度、释义缓存和旧 reader IndexedDB 书籍。
 
-- 背词词库、SRS 进度、已认识/待复习列表、错词本分组。
-- 阅读书籍正文、书籍元数据、划线/错词高亮、阅读进度。
-- 阅读字体、字号、行高、主题、阅读模式、最近书籍。
-- 学习统计、打卡日历、趋势数据。
-- AI 设置中的服务地址和模型名称。SiliconFlow API Key 只保存在当前设备本地，不会写入 Supabase 同步快照。
+旧版 AI Key 只有在 Android Keystore 可用且写入成功后才会从旧存储移除；普通浏览器无法安全接管旧 Key，会显示需在 APK 中重新配置。新版本不把 Key 写入 localStorage、IndexedDB、日志或备份。
 
-释义缓存仍保留在当前设备本地，因为它可以重新生成，不属于用户学习记录。
-TTS 音频缓存也只保留在当前设备/本地服务缓存中，不属于用户学习记录。
+## 阅读器
+
+- 一级格式：PDF、EPUB；同时支持 TXT、Markdown、HTML。
+- EPUB：默认优先使用完整 `foliate-js`（固定提交 `df623dbe6610fd98a7c2d5d7a5c23bfcfc7d19f3`）提供 EPUB3/NCX 目录、图片/原始样式、内部链接、脚注、全书搜索、CFI、RTL/竖排和固定版式能力；初始化或渲染失败自动回退既有 `EpubEngine`。Foliate 细节隔离在 `FoliateEpubEngine`/`ReaderEngineAdapter`，外部脚本和网络资源被阻断。
+- EPUB 设置继续映射现有 flow、字体、字号、字重、字间距、行距、段距、首行缩进、主题和页边距；电子墨水模式启用 `eink`、关闭动画且不增加滑动手势。
+- PDF：原版面 Canvas 和文本重排两种模式；原版面支持缩放、旋转、对比度、裁白边入口、灰度和反色；有文本层时可搜索和选择，无文本扫描 PDF 会明确提示只能原版面阅读。
+- 阅读进度、书签和笔记写入本地书籍记录；EPUB 增量写入 `epubcfi` locator，同时保留旧 chapter/page/percent 字段并按 CFI、href/fraction、旧字段顺序恢复。阅读翻页不使用滑动动画或 smooth scroll。
+
+书籍通过 `<input type=file>` 进入 WebView 系统文件选择器（Android 上由系统 SAF 处理），然后复制为应用私有数据；应用不申请全盘存储权限。
+
+## 词典
+
+内置 Collins 词典资源随 Web 包本地打包。词典页支持：
+
+- StarDict：`.ifo`、`.idx`、`.dict`、`.dict.dz`，可用 ZIP 组合导入。
+- MDX/MDD：`.mdx` 和可选资源 `.mdd`。
+- 应用自有 ZIP：包含 manifest 和 JSON/JSONL entries。
+
+导入会建立本地索引，并把索引与原文件保存到应用私有目录，重启后自动重建；常规 StarDict 条目按文件切片读取，不扫描整本词典。导入支持取消、失败回滚、启停、精确查词和基础词形候选。外部词典 HTML 会清洗脚本、事件属性、iframe、外链和不允许的资源。
+
+## 背词
+
+- 统一的 SRS 学习状态、每日新词/复习计划、基础/造句/听音模式。
+- 支持认识、不认识、纠正、完成复习、继续复习和词库重置；包含已认识列表、待复习列表、错词分组，以及从阅读选区加入错词本。
+- 学习页显示本地 Collins 释义，未收录时可主动点击 AI 释义；造句批改、造句挑战和翻译挑战只在主动提交时请求 AI。
+- Android APK 使用系统 TTS 朗读，浏览器使用本地 SpeechSynthesis，不依赖外部音频服务。
+- 学习统计记录分钟数、互动次数、认识/复习数量、连续学习天数和最近 14 天活动。
+- `ts-fsrs` 5.2.3 只生成 `fsrsShadow` 和 `reviewHistory` 影子数据；“认识”不会映射为 FSRS Good，正式状态、固定间隔、队列和统计仍由现有调度逻辑唯一决定。
+
+## AI 配置
+
+在 APK 设置中填写自定义 OpenAI-compatible HTTPS Base URL、模型、提示词和 API Key。默认请求 `stream:false`，只有用户点选“AI 解释”“AI 翻译”或自定义操作才发送选中文本；自定义操作支持 `{{selection}}`、`{{sentence}}`、`{{paragraph}}`、`{{chapterTitle}}`、`{{bookTitle}}`、`{{sourceLanguage}}`、`{{targetLanguage}}`。
+
+AI Key 由原生 `SecureStorage` 插件写入 Android Keystore，网络由原生 `NativeAi` HTTPS 桥发送以避开 WebView CORS。飞行模式下背词、SRS、阅读、词典、笔记、书签和备份仍可用，AI 会给出离线错误而不自动重试。
+
+## 备份和恢复
+
+普通 ZIP 备份包括学习状态、设置、书籍元数据、书签/笔记、词典配置/索引和自定义 AI action，但不包括 API Key、AI 缓存和书籍正文/原文件。勾选“完整 ZIP”后才包含书籍和词典原文件。恢复前会校验格式、版本和敏感字段；恢复不会覆盖 Keystore 中的 API Key。
+
+## 墨水屏和实体键
+
+应用提供极速/均衡/质量三档重绘配置，禁用动画、渐变、毛玻璃、大阴影和 smooth scroll；阅读页拦截实体音量键、翻页键和方向键，其他页面不劫持系统音量。设置页记录真实 Android key code，方便在 Bigme 上调整下一页/上一页/菜单映射。
+
+## 已知限制
+
+- 当前没有连接 Bigme 真机；实体键、灰度/刷新观感、文件选择器和 Keystore 需要在设备上完成验收。
+- PDF 使用 pdf.js 的本地打包实现，接口已抽象为 `PdfEngine`，未来可替换原生 PDFium/MuPDF。当前打开 PDF 会预取文本层用于全文搜索；Canvas 只保留当前渲染页。
+- StarDict `.dict.dz`、MDX/MDD 的常见导入路径已覆盖；加密 MDX、特殊压缩变体和极少数非标准资源仍需用真实词典样本补测。
+- 当前没有 release 签名 APK，也没有伪造 release keystore。
+
+详细阶段记录见 [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md)，依赖许可证见 [`docs/THIRD_PARTY_LICENSES.md`](docs/THIRD_PARTY_LICENSES.md)，真机清单见 [`docs/BIGME_B7_PRO_CHECKLIST.md`](docs/BIGME_B7_PRO_CHECKLIST.md)。
