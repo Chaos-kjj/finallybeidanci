@@ -4,7 +4,7 @@ Status: **FROZEN FOR OWNER REVIEW**
 
 Base: `reconstruction/canonical-2026-08-07` from commit `eb927192336527d56ce5a018a1d6a41a751b1921`
 
-This backlog describes isolated future work. It does not authorize implementation in Phase 0. Every item requires its own worktree, branch, pull request, regression evidence, and canonical delivery validation.
+This backlog records isolated reconstruction task definitions and their current status. It does not retroactively authorize implementation in Phase 0. Every item requires its own worktree, branch, pull request, regression evidence, and canonical delivery validation.
 
 ## Dependency semantics
 
@@ -19,12 +19,12 @@ The work is intentionally not ordered by the R-number labels.
 
 | Lane | Classification and sequence | Reason |
 | --- | --- | --- |
-| Infrastructure gate | I1 before product-code implementation merge workflows | I1 has no recovery hard dependency, but its minimum Node-test and Web-build CI is a hard gate for product-code implementation pull requests. |
+| Infrastructure gate | I1 before product-code implementation merge workflows — SATISFIED | I1 has no recovery hard dependency. Its product-code merge hard gate is satisfied, and the current required checks are Node tests, Web production build, and Android lint. |
 | Historical data gate | V1 before R1 is RECOMMENDED SEQUENCING; V1 is a HARD GATE FOR FINAL RECONSTRUCTION ACCEPTANCE | R1 can use A's current fingerprint and annotation model independently. Earlier V1 evidence reduces compatibility rework, while final reconstruction still cannot enter `main` without a V1 conclusion. |
 | Data safety and reader | R2 before R1 is RECOMMENDED SEQUENCING | R2 is a small, high-value data-loss fix. Both tasks touch storage, `src/main.js`, and nearby tests, so ordering reduces conflicts; R2 is not a semantic prerequisite for R1. |
 | Dictionary | R3 before R4 is RECOMMENDED SEQUENCING | R4 can be designed and validated against A's current StarDict semantics. R3 first merely reduces repeated edits and conflicts in `stardict-provider` and `import-service`. |
 | Study timing | R5 independently after I1 | Its primary logic is isolated in study statistics and lifecycle wiring. |
-| Android native | I1, then B1/B2, then R6 final validation | B1/B2 must establish a truthful Android lint pass before lint becomes a required CI check and before R6 can complete its required lint evidence. |
+| Android native | I1, then B1/B2, then R6 final validation — prerequisites SATISFIED | B1/B2 established a truthful Android lint pass before lint became a required CI check. R6 must still complete its own lint evidence and Bigme physical-device validation. |
 | Maintenance | B3 and B4 as isolated tasks after I1 | Dependency/security and bundle-size work can change broad surfaces and must never be folded into a recovery pull request. |
 | Optional tooling | O1 only after an explicit decision | O1 is optional/deferred and does not depend on I1 or block canonical reconstruction. |
 
@@ -42,20 +42,28 @@ Parallel work is safe only across separate lanes and separate worktrees. Recomme
 
 ### I1 — Reconstruction CI
 
-**Status:** REQUIRED BEFORE IMPLEMENTATION PRs
+**Status:** DONE
+
+**Current gate state**
+
+- HARD GATE FOR PRODUCT-CODE MERGE WORKFLOW: **SATISFIED**.
+- Current required checks:
+  - Node tests
+  - Web production build
+  - Android lint
 
 **Scope**
 
 - Establish the minimum automated quality gate for pull requests targeting `reconstruction/canonical-2026-08-07`.
-- Phase 1 must automatically run the Node automated tests and the production Web build.
-- Do not make the currently failing Android lint a required Phase 1 pass condition. Promote Android lint only after B1/B2 are correctly resolved.
+- Phase 1 established required Node automated tests and production Web build checks.
+- Android lint was promoted to a required check only after B1/B2 were correctly resolved.
 - Do not deploy, install an APK, mutate Git history, or change product behavior.
 
 **Source evidence**
 
 - A's recorded baseline shows the Node automated tests and production Web build pass.
-- No reconstruction CI workflow currently exists.
-- B1/B2 are known Android lint failures, so claiming a required green lint gate before fixing them would be false governance evidence.
+- I1 began from a baseline where no reconstruction CI workflow existed; the workflow is now implemented and required.
+- B1/B2 were known Android lint failures and were correctly resolved before Android lint was promoted to a required check.
 
 **Target files/modules**
 
@@ -76,13 +84,13 @@ Parallel work is safe only across separate lanes and separate worktrees. Recomme
 - Pull requests targeting the reconstruction integration branch automatically run Node tests and a production Web build.
 - A failure in either command produces a failed required check.
 - The workflow does not use skip rules, `continue-on-error`, ignored exit codes, or equivalent false-green behavior.
-- Phase 1 does not require Android lint or Android build while B1/B2 remain unresolved.
+- Phase 1 did not require Android lint while B1/B2 remained unresolved; Android lint is now required, while Android build remains outside the required checks.
 - CI changes no product behavior and performs no deployment, APK installation, or dangerous Git operation.
 
 **Dependencies**
 
 - I1 has no recovery hard dependency.
-- I1 Phase 1 is a HARD GATE FOR PRODUCT-CODE MERGE WORKFLOW for R1–R6, B1/B2, B3, B4, and any V1 follow-up that modifies product code.
+- I1 Phase 1 is a HARD GATE FOR PRODUCT-CODE MERGE WORKFLOW for R1–R6, B1/B2, B3, B4, and any V1 follow-up that modifies product code. This hard gate is **SATISFIED**.
 - V1 evidence-only validation may proceed independently; any resulting product-code implementation may not enter its merge workflow before I1.
 - O1 remains optional/deferred and does not depend on I1.
 
@@ -93,7 +101,7 @@ Parallel work is safe only across separate lanes and separate worktrees. Recomme
 - Revert only the isolated CI workflow pull request.
 - A rollback must not alter product code, deployment state, Git history, or existing local validation commands.
 
-**PR boundary:** `infra/reconstruction-ci`; Phase 1 Node tests and production Web build only, with no Android required gate and no product implementation.
+**PR boundary:** `infra/reconstruction-ci`; initial Phase 1 Node tests and production Web build only, with no product implementation. Android lint was promoted later through B1/B2.
 
 **Definition of Done**
 
@@ -461,7 +469,15 @@ Parallel work is safe only across separate lanes and separate worktrees. Recomme
 
 ### B1/B2 — Restore a clean Android lint baseline
 
-**Status:** KNOWN BASELINE ISSUE — NOT STARTED
+**Status:** DONE
+
+**Completion record**
+
+- `MissingSuperCall` was correctly fixed.
+- API-23 `ConcurrentMap` compatibility was correctly fixed, and `minSdk` remains 23.
+- Android lint passes with 0 errors; the 19 original baseline warnings remain recorded.
+- Targeted regression tests were established, and Android compile, JVM tests, and build passed.
+- Android lint was added to reconstruction CI as a required check.
 
 **Scope**
 
@@ -489,7 +505,7 @@ Parallel work is safe only across separate lanes and separate worktrees. Recomme
 - Only B1/B2 are changed.
 - Android lint becomes a truthful required reconstruction CI check only after both baseline errors are resolved.
 
-**Dependencies:** I1 Phase 1 is a HARD GATE FOR PRODUCT-CODE MERGE WORKFLOW for B1/B2. B1/B2 are a HARD DEPENDENCY for R6 final lint validation, but have no recovery implementation dependency.
+**Dependencies:** I1 Phase 1 is a HARD GATE FOR PRODUCT-CODE MERGE WORKFLOW for B1/B2 — **SATISFIED**. B1/B2 are a HARD DEPENDENCY for R6 final lint validation — **SATISFIED**; they have no recovery implementation dependency.
 
 **Risk:** MEDIUM — incorrect lifecycle or compatibility fixes can alter native behavior.
 
@@ -547,8 +563,8 @@ Parallel work is safe only across separate lanes and separate worktrees. Recomme
 
 **Dependencies**
 
-- I1 Phase 1 is a HARD GATE FOR PRODUCT-CODE MERGE WORKFLOW for R6.
-- B1/B2 lint baseline is a HARD DEPENDENCY for R6 final validation because R6 requires a truthful Android lint PASS.
+- I1 Phase 1 is a HARD GATE FOR PRODUCT-CODE MERGE WORKFLOW for R6 — **SATISFIED**.
+- B1/B2 lint baseline is a HARD DEPENDENCY for R6 final validation — **SATISFIED**. R6 still requires its own truthful Android lint PASS and Bigme physical-device evidence.
 - No dependency on `EInkRenderScheduler` or any other deferred E-ink feature.
 
 **Risk:** HIGH — native event consumption can break typing, back navigation, or device controls.
@@ -677,4 +693,4 @@ Parallel work is safe only across separate lanes and separate worktrees. Recomme
 
 - Do not create an E rich-metadata migration task without new production database/backup evidence.
 - Do not create tasks for Foliate EPUB, CFI/Foliate locator, FSRS shadow, `stableShuffle`, custom statistics ranges, local dictionary audio, or `EInkRenderScheduler` without explicit product-owner authorization.
-- No CI system is claimed to exist. I1 is the formal required but unimplemented infrastructure task; `infra/reconstruction-ci` is reserved for its isolated pull request and must not be bundled with behavior recovery.
+- Reconstruction CI is implemented. I1 is DONE, its product-code merge hard gate is SATISFIED, and the current required checks are Node tests, Web production build, and Android lint.
