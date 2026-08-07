@@ -1,0 +1,5 @@
+第一段：reader browser smoke test。
+
+第二段：这里是搜索目标 target-phrase，应该能被全文搜索找到并跳转。
+
+第三段：冷启动后仍然应该显示这本书，并保留完整正文。
