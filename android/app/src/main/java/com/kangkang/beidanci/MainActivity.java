@@ -21,7 +21,7 @@ public class MainActivity extends BridgeActivity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
                     OnBackInvokedDispatcher.PRIORITY_OVERLAY,
-                    this::handleBackPressed);
+                    this::onBackPressed);
         }
     }
 
@@ -30,7 +30,7 @@ public class MainActivity extends BridgeActivity {
         KeyEventsPlugin plugin = KeyEventsPlugin.getInstance();
         int code = event.getKeyCode();
         if (plugin != null && code == KeyEvent.KEYCODE_BACK && event.getAction() == KeyEvent.ACTION_UP) {
-            handleBackPressed();
+            onBackPressed();
             return true;
         }
         boolean readerKey = code == KeyEvent.KEYCODE_VOLUME_UP || code == KeyEvent.KEYCODE_VOLUME_DOWN
@@ -45,15 +45,11 @@ public class MainActivity extends BridgeActivity {
 
     @Override
     public void onBackPressed() {
-        handleBackPressed();
-    }
-
-    private void handleBackPressed() {
         KeyEventsPlugin plugin = KeyEventsPlugin.getInstance();
         if (plugin != null && plugin.isReaderMode()) {
             plugin.emitBackPressed();
             return;
         }
-        MainActivity.super.onBackPressed();
+        super.onBackPressed();
     }
 }
