@@ -2,13 +2,33 @@
   "name": "finallybeidanci",
   "version": "1.0.0",
   "private": true,
-  "description": "Static PWA for English vocabulary and reading practice.",
+  "description": "Offline-first Android e-ink reader and vocabulary trainer.",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js",
-    "test": "node tests/regression.test.js"
+    "start": "vite --host 127.0.0.1",
+    "dev": "vite --host 127.0.0.1",
+    "build": "npm run android:apk",
+    "build:web": "vite build && node scripts/copy-static-assets.js",
+    "test": "npm run test:all && npm run verify:apk",
+    "test:all": "node --test tests/*.test.js",
+    "android:sync": "npm run build:web && npx cap sync android && node scripts/stamp-build.js",
+    "android:assemble": "node scripts/assemble-android.js",
+    "android:apk": "npm run test:all && npm run lint:offline && npm run android:sync && npm run android:assemble && npm run verify:apk",
+    "android:debug": "npm run build && npx cap open android",
+    "verify:apk": "node scripts/verify-apk.js",
+    "lint:offline": "node scripts/check-offline.js"
   },
   "engines": {
     "node": ">=18"
+  },
+  "dependencies": {
+    "@capacitor/android": "^7.4.3",
+    "@capacitor/core": "^7.4.3",
+    "fflate": "^0.8.2",
+    "pdfjs-dist": "5.7.284"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^7.4.3",
+    "typescript": "^7.0.2",
+    "vite": "^7.1.3"
   }
 }

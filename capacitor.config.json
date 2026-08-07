@@ -1,0 +1,11 @@
+{
+  "appId": "com.kangkang.beidanci",
+  "appName": "康康背词器",
+  "webDir": "dist",
+  "bundledWebRuntime": false,
+  "server": { "androidScheme": "https" },
+  "plugins": {
+    "SplashScreen": { "launchAutoHide": true },
+    "Keyboard": { "resize": "body" }
+  }
+}
