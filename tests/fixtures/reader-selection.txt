@@ -1,0 +1,3 @@
+Stable anchors survive a page break and a layout change.
+
+This second paragraph gives the browser integration test enough text to render multiple pages. Reflow should keep the same words selected after the font size changes.

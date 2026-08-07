@@ -5,6 +5,7 @@
     }
     if (root) {
         root.parseEpubToText = api.parseEpubToText;
+        root.parseEpubBook = api.parseEpubBook;
     }
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
     const UTF8_FLAG = 0x0800;
@@ -55,6 +56,101 @@
         }
 
         return chapterTexts.join('\n\n');
+    }
+
+    async function parseEpubBook(arrayBuffer, options = {}) {
+        const zip = await readZipEntries(arrayBuffer);
+        const containerXml = await zip.getText('META-INF/container.xml');
+        if (!containerXml) throw new Error('EPUB 缺少 META-INF/container.xml');
+        const packagePath = getContainerPackagePath(containerXml);
+        if (!packagePath) throw new Error('EPUB 未声明 OPF package 文件');
+        const packageXml = await zip.getText(packagePath);
+        if (!packageXml) throw new Error('EPUB 缺少 OPF package 文件');
+
+        const packageDir = getDirectory(packagePath);
+        const manifest = parseManifest(packageXml, packageDir);
+        const spine = parseSpine(packageXml);
+        const labels = await parseChapterLabels(zip, manifest);
+        const tocTree = await parseEpubToc(zip, manifest);
+        const metadata = parsePackageMetadata(packageXml);
+        const chapters = [];
+
+        for (let index = 0; index < spine.length; index += 1) {
+            const spineItem = spine[index];
+            if (spineItem.linear === 'no') continue;
+            const item = manifest.byId.get(spineItem.idref);
+            if (!item || !isHtmlManifestItem(item) || isSkippableEpubItem(item)) continue;
+            const html = await zip.getText(item.path);
+            if (!html) continue;
+            const safeHtml = sanitizeEpubHtml(html, options.maxChapterBytes || 2_000_000);
+            const text = htmlToReadableText(safeHtml);
+            if (!text) continue;
+            chapters.push({
+                id: item.id,
+                href: item.path,
+                title: labels.get(item.path) || item.title || `第 ${chapters.length + 1} 章`,
+                html: safeHtml,
+                text,
+                spineIndex: index,
+                documentIndex: chapters.length,
+                anchorSchemaVersion: 1
+            });
+        }
+
+        if (!chapters.length) throw new Error('EPUB 没有找到可阅读正文');
+        const chapterIndexByPath = new Map(chapters.map((chapter, index) => [chapter.href.toLowerCase(), index]));
+        const flattenedToc = flattenToc(tocTree);
+        const tocTitleByPath = new Map();
+        flattenedToc.forEach(item => {
+            const path = String(item.href || '').toLowerCase();
+            if (path && item.title && !tocTitleByPath.has(path)) tocTitleByPath.set(path, item.title);
+        });
+        chapters.forEach(chapter => {
+            const tocTitle = tocTitleByPath.get(chapter.href.toLowerCase());
+            if (tocTitle) chapter.title = tocTitle;
+        });
+        const toc = flattenedToc.map(item => ({
+            ...item,
+            chapterIndex: chapterIndexByPath.get(item.href.toLowerCase()) ?? 0,
+            location: { format: 'epub', href: item.href, fragment: item.fragment || '', progression: 0 }
+        }));
+        const assetManifest = Object.fromEntries(manifest.items.map(item => [item.path.toLowerCase(), { path: item.path, mediaType: item.mediaType }]));
+        return {
+            title: metadata.title || options.title || '',
+            author: metadata.author || '',
+            language: metadata.language || '',
+            identifier: metadata.identifier || '',
+            anchorSchemaVersion: 1,
+            chapters,
+            toc,
+            assetManifest,
+            getAsset: path => zip.getBytes(path)
+        };
+    }
+
+    function parsePackageMetadata(packageXml) {
+        const values = {};
+        ['title', 'creator', 'language', 'identifier'].forEach(name => {
+            const match = packageXml.match(new RegExp(`<[^:>\\s]*:?${name}\\b[^>]*>([\\s\\S]*?)<\\/[^:>\\s]*:?${name}>`, 'i'));
+            if (match) values[name === 'creator' ? 'author' : name] = decodeHtmlEntities(stripTags(match[1])).trim();
+        });
+        return values;
+    }
+
+    function sanitizeEpubHtml(html, maxBytes) {
+        let safe = String(html || '').slice(0, maxBytes);
+        safe = safe
+            .replace(/<!--[\s\S]*?-->/g, '')
+            .replace(/<\/?(?:script|style|iframe|object|embed|form|base|meta|link|audio|video|source|track)\b[^>]*>[\s\S]*?<\/?(?:script|style|iframe|object|embed|form|base|meta|link|audio|video|source|track)\s*>/gi, '')
+            .replace(/\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+            .replace(/\s(src|href)\s*=\s*("([^"]*)"|'([^']*)'|[^\s>]+)/gi, (match, attribute, quoted, doubleValue, singleValue) => {
+                const value = doubleValue ?? singleValue ?? quoted;
+                if (/^(?:https?:|javascript:|data:|file:|\/\/)/i.test(value)) return '';
+                return ` ${attribute}=${quoted}`;
+            })
+            .replace(/javascript\s*:/gi, '')
+            .slice(0, maxBytes);
+        return safe;
     }
 
     async function readZipEntries(arrayBuffer) {
@@ -199,14 +295,14 @@
         for (const item of manifest.items) {
             if (item.mediaType === 'application/x-dtbncx+xml' || /\.ncx$/i.test(item.href)) {
                 const ncx = await zip.getText(item.path);
-                parseNcxLabels(ncx, item.path).forEach((label, path) => labels.set(path, label));
+                parseNcxLabels(ncx, item.path).forEach((label, path) => { if (!labels.has(path)) labels.set(path, label); });
             }
         }
 
         for (const item of manifest.items) {
             if (!hasProperty(item, 'nav')) continue;
             const navHtml = await zip.getText(item.path);
-            parseNavLabels(navHtml, item.path).forEach((label, path) => labels.set(path, label));
+            parseNavLabels(navHtml, item.path).forEach((label, path) => { if (!labels.has(path)) labels.set(path, label); });
         }
 
         return labels;
@@ -227,6 +323,77 @@
             }
         }
         return labels;
+    }
+
+    async function parseEpubToc(zip, manifest) {
+        const trees = [];
+        for (const item of manifest.items) {
+            if (item.mediaType === 'application/x-dtbncx+xml' || /\.ncx$/i.test(item.href)) {
+                const ncx = await zip.getText(item.path);
+                if (ncx) trees.push(parseNcxTree(ncx, item.path));
+            }
+        }
+        for (const item of manifest.items) {
+            if (!hasProperty(item, 'nav')) continue;
+            const nav = await zip.getText(item.path);
+            if (nav) trees.push(parseNavTree(nav, item.path));
+        }
+        return trees.flat().filter(Boolean);
+    }
+
+    function parseNcxTree(ncx, ncxPath) {
+        const roots = [];
+        const stack = [];
+        const tokenPattern = /<\/?[^>]+>/g;
+        let token;
+        while ((token = tokenPattern.exec(ncx))) {
+            const value = token[0];
+            if (/^<(?![\/*!])[^>]*\bnavPoint\b[^>]*>$/i.test(value)) {
+                const attrs = parseAttributes(value);
+                const node = { id: attrs.id || `toc-${roots.length}-${stack.length}`, title: '', href: '', fragment: '', children: [] };
+                const closeIndex = ncx.indexOf('</navPoint>', tokenPattern.lastIndex);
+                const navLabelText = ncx.slice(tokenPattern.lastIndex, closeIndex < 0 ? ncx.length : closeIndex).match(/<[^>]*text\b[^>]*>([\s\S]*?)<\/[^>]*text>/i);
+                node.title = decodeHtmlEntities(stripTags(navLabelText?.[1] || '')).trim();
+                if (stack.length) stack[stack.length - 1].children.push(node); else roots.push(node);
+                stack.push(node);
+                continue;
+            }
+            if (/^<\/[^>]*navPoint\s*>$/i.test(value)) { stack.pop(); continue; }
+            if (!stack.length) continue;
+            const current = stack[stack.length - 1];
+            if (/^<[^/][^>]*text\b/i.test(value)) {
+                const end = ncx.indexOf('<', tokenPattern.lastIndex);
+                if (end >= 0) current.title = decodeHtmlEntities(ncx.slice(tokenPattern.lastIndex, end)).trim();
+            }
+            if (/^<[^>]*content\b/i.test(value)) {
+                const attrs = parseAttributes(value);
+                const reference = resolveZipReference(getDirectory(ncxPath), attrs.src || '');
+                current.href = reference.path;
+                current.fragment = reference.fragment;
+            }
+        }
+        return roots;
+    }
+
+    function parseNavTree(navHtml, navPath) {
+        const roots = [];
+        const anchorPattern = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
+        let match;
+        while ((match = anchorPattern.exec(navHtml))) {
+            const attrs = parseAttributes(match[1]);
+            const reference = resolveZipReference(getDirectory(navPath), attrs.href || '');
+            const title = decodeHtmlEntities(stripTags(match[2])).trim();
+            if (title && reference.path) roots.push({ id: `nav-${roots.length}`, title, href: reference.path, fragment: reference.fragment, children: [] });
+        }
+        return roots;
+    }
+
+    function flattenToc(nodes, depth = 0, output = []) {
+        (nodes || []).forEach(node => {
+            output.push({ id: node.id, title: node.title, href: node.href, fragment: node.fragment, depth });
+            flattenToc(node.children, depth + 1, output);
+        });
+        return output;
     }
 
     function parseNavLabels(navHtml, navPath) {
@@ -371,6 +538,13 @@
         return normalizeZipPath(`${baseDir ? `${baseDir}/` : ''}${decodedHref}`);
     }
 
+    function resolveZipReference(baseDir, href) {
+        const raw = String(href || '');
+        const hash = raw.indexOf('#');
+        const fragment = hash >= 0 ? safeDecodeUri(raw.slice(hash + 1)) : '';
+        return { path: resolveZipPath(baseDir, hash >= 0 ? raw.slice(0, hash) : raw), fragment };
+    }
+
     function getDirectory(path) {
         const normalized = normalizeZipPath(path);
         const lastSlash = normalized.lastIndexOf('/');
@@ -412,6 +586,9 @@
 
     return {
         parseEpubToText,
-        htmlToReadableText
+        parseEpubBook,
+        htmlToReadableText,
+        resolveZipPath,
+        resolveZipReference
     };
 });
