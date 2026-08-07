@@ -1,3 +1,15 @@
 .cache/
+.DS_Store
+**/.DS_Store
 .env
 .env.*
+node_modules/
+dist/
+coverage/
+*.apk
+*.aab
+*.jks
+*.keystore
+android/.gradle/
+android/local.properties
+android/app/build/

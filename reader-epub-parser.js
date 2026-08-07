@@ -5,11 +5,18 @@
     }
     if (root) {
         root.parseEpubToText = api.parseEpubToText;
+        root.parseEpubBook = api.parseEpubBook;
     }
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
     const UTF8_FLAG = 0x0800;
     const ZIP_STORED = 0;
     const ZIP_DEFLATED = 8;
+    const MAX_EPUB_UNCOMPRESSED_BYTES = 768 * 1024 * 1024;
+    const MAX_EPUB_SOURCE_BYTES = 512 * 1024 * 1024;
+    const MAX_EPUB_ENTRY_BYTES = 96 * 1024 * 1024;
+    const MAX_EPUB_CHAPTER_BYTES = 2 * 1024 * 1024;
+    const MAX_EPUB_ASSET_BYTES = 16 * 1024 * 1024;
+    const MAX_EPUB_COVER_BYTES = 8 * 1024 * 1024;
 
     async function parseEpubToText(arrayBuffer, options = {}) {
         const zip = await readZipEntries(arrayBuffer);
@@ -57,18 +64,137 @@
         return chapterTexts.join('\n\n');
     }
 
+    async function parseEpubBook(arrayBuffer, options = {}) {
+        const zip = await readZipEntries(arrayBuffer);
+        const containerXml = await zip.getText('META-INF/container.xml');
+        if (!containerXml) throw new Error('EPUB 缺少 META-INF/container.xml');
+        const packagePath = getContainerPackagePath(containerXml);
+        if (!packagePath) throw new Error('EPUB 未声明 OPF package 文件');
+        const packageXml = await zip.getText(packagePath);
+        if (!packageXml) throw new Error('EPUB 缺少 OPF package 文件');
+
+        const packageDir = getDirectory(packagePath);
+        const manifest = parseManifest(packageXml, packageDir);
+        const spine = parseSpine(packageXml);
+        const labels = await parseChapterLabels(zip, manifest);
+        const tocTree = await parseEpubToc(zip, manifest);
+        const metadata = parsePackageMetadata(packageXml);
+        const cover = await parseCoverAsset(zip, packageXml, manifest);
+        const chapters = [];
+
+        for (let index = 0; index < spine.length; index += 1) {
+            const spineItem = spine[index];
+            if (spineItem.linear === 'no') continue;
+            const item = manifest.byId.get(spineItem.idref);
+            if (!item || !isHtmlManifestItem(item) || isSkippableEpubItem(item)) continue;
+            chapters.push({
+                id: item.id,
+                href: item.path,
+                title: labels.get(item.path) || item.title || `第 ${chapters.length + 1} 章`,
+                // Chapter markup is loaded on demand by EpubEngine. Keeping
+                // only the spine descriptor here avoids retaining every
+                // chapter's raw and sanitized HTML before the first page is
+                // visible. `text` is populated by the engine when a chapter
+                // is opened or searched.
+                html: '',
+                text: '',
+                spineIndex: index
+            });
+        }
+
+        if (!chapters.length) throw new Error('EPUB 没有找到可阅读正文');
+        const chapterIndexByPath = new Map(chapters.map((chapter, index) => [chapter.href.toLowerCase(), index]));
+        const flattenedToc = flattenToc(tocTree);
+        const tocTitleByPath = new Map();
+        flattenedToc.forEach(item => {
+            const path = String(item.href || '').toLowerCase();
+            if (path && item.title && !tocTitleByPath.has(path)) tocTitleByPath.set(path, item.title);
+        });
+        chapters.forEach(chapter => {
+            const tocTitle = tocTitleByPath.get(chapter.href.toLowerCase());
+            if (tocTitle) chapter.title = tocTitle;
+        });
+        const toc = flattenedToc.filter(item => chapterIndexByPath.has(String(item.href || '').toLowerCase())).map(item => ({
+            ...item,
+            chapterIndex: chapterIndexByPath.get(item.href.toLowerCase()) ?? 0,
+            location: { format: 'epub', href: item.href, fragment: item.fragment || '', progression: 0 }
+        }));
+        const assetManifest = Object.fromEntries(manifest.items.map(item => [item.path.toLowerCase(), { path: item.path, mediaType: item.mediaType }]));
+        return {
+            title: metadata.title || options.title || '',
+            author: metadata.author || '',
+            language: metadata.language || '',
+            cover,
+            chapters,
+            toc,
+            assetManifest,
+            getAsset: path => zip.getBytes(path, { maxBytes: MAX_EPUB_ASSET_BYTES }),
+            loadChapterHtml: async index => {
+                const chapter = chapters[index];
+                if (!chapter) return '';
+                const maxChapterBytes = Math.min(MAX_EPUB_CHAPTER_BYTES, Number(options.maxChapterBytes) || MAX_EPUB_CHAPTER_BYTES);
+                const html = await zip.getText(chapter.href, { maxBytes: maxChapterBytes });
+                return sanitizeEpubHtml(html, maxChapterBytes);
+            }
+        };
+    }
+
+    function parsePackageMetadata(packageXml) {
+        const values = {};
+        ['title', 'creator', 'language', 'identifier'].forEach(name => {
+            const match = packageXml.match(new RegExp(`<[^:>\\s]*:?${name}\\b[^>]*>([\\s\\S]*?)<\\/[^:>\\s]*:?${name}>`, 'i'));
+            if (match) values[name === 'creator' ? 'author' : name] = decodeHtmlEntities(stripTags(match[1])).trim();
+        });
+        return values;
+    }
+
+    async function parseCoverAsset(zip, packageXml, manifest) {
+        const metaCover = packageXml.match(/<meta\b[^>]*\bname\s*=\s*["']cover["'][^>]*\bcontent\s*=\s*["']([^"']+)["'][^>]*>/i)
+            || packageXml.match(/<meta\b[^>]*\bcontent\s*=\s*["']([^"']+)["'][^>]*\bname\s*=\s*["']cover["'][^>]*>/i);
+        const coverItem = manifest.items.find(item => hasProperty(item, 'cover-image'))
+            || (metaCover?.[1] ? manifest.byId.get(metaCover[1]) : null)
+            || manifest.items.find(item => /^(?:image\/|application\/x-font|image)/i.test(item.mediaType) && /(^|[\/_ .-])cover(?:[\/_ .-]|$)/i.test(`${item.id} ${item.href}`));
+        if (!coverItem) return null;
+        let data;
+        try { data = await zip.getBytes(coverItem.path, { maxBytes: MAX_EPUB_COVER_BYTES }); } catch (_) { return null; }
+        if (!data?.length) return null;
+        return { path: coverItem.path, mediaType: coverItem.mediaType || 'image/jpeg', data };
+    }
+
+    function sanitizeEpubHtml(html, maxBytes) {
+        let safe = String(html || '').slice(0, maxBytes);
+        safe = safe
+            .replace(/<!--[\s\S]*?-->/g, '')
+            .replace(/<\/?(?:script|style|iframe|object|embed|form|base|meta|link|audio|video|source|track)\b[^>]*>[\s\S]*?<\/?(?:script|style|iframe|object|embed|form|base|meta|link|audio|video|source|track)\s*>/gi, '')
+            .replace(/\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+            .replace(/\s(src|href)\s*=\s*("([^"]*)"|'([^']*)'|[^\s>]+)/gi, (match, attribute, quoted, doubleValue, singleValue) => {
+                const value = doubleValue ?? singleValue ?? quoted;
+                if (String(attribute).toLowerCase() === 'href' && /^#/i.test(value)) return ` ${attribute}=${quoted}`;
+                if (String(attribute).toLowerCase() === 'href' && !/^(?:[a-z][a-z0-9+.-]*:|\/\/|\\)/i.test(value)) return ` ${attribute}=${quoted}`;
+                if (/^(?:https?:|mailto:|javascript:|data:|file:|\/\/)/i.test(value)) return '';
+                return ` ${attribute}=${quoted}`;
+            })
+            .replace(/javascript\s*:/gi, '')
+            .slice(0, maxBytes);
+        return safe;
+    }
+
     async function readZipEntries(arrayBuffer) {
         const bytes = arrayBuffer instanceof Uint8Array
             ? arrayBuffer
             : new Uint8Array(arrayBuffer);
+        if (bytes.byteLength > MAX_EPUB_SOURCE_BYTES) throw new Error('EPUB 文件超过 512 MB 上限');
         const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
         const eocdOffset = findEndOfCentralDirectory(view);
         const totalEntries = view.getUint16(eocdOffset + 10, true);
         const centralDirectoryOffset = view.getUint32(eocdOffset + 16, true);
+        if (centralDirectoryOffset >= view.byteLength && totalEntries > 0) throw new Error('EPUB ZIP 中央目录位置无效');
         const entries = new Map();
+        let totalUncompressedBytes = 0;
         let offset = centralDirectoryOffset;
 
         for (let index = 0; index < totalEntries; index += 1) {
+            if (offset < 0 || offset + 46 > view.byteLength) throw new Error('EPUB ZIP 中央目录越界');
             if (view.getUint32(offset, true) !== 0x02014b50) {
                 throw new Error('EPUB ZIP 中央目录损坏');
             }
@@ -81,8 +207,13 @@
             const extraLength = view.getUint16(offset + 30, true);
             const commentLength = view.getUint16(offset + 32, true);
             const localHeaderOffset = view.getUint32(offset + 42, true);
+            if (offset + 46 + fileNameLength + extraLength + commentLength > view.byteLength) throw new Error('EPUB ZIP 中央目录长度无效');
             const nameBytes = bytes.subarray(offset + 46, offset + 46 + fileNameLength);
             const name = normalizeZipPath(decodeZipString(nameBytes, flags));
+
+            if (uncompressedSize > MAX_EPUB_ENTRY_BYTES) throw new Error(`EPUB 文件条目过大：${name || '未知文件'}`);
+            totalUncompressedBytes += uncompressedSize;
+            if (totalUncompressedBytes > MAX_EPUB_UNCOMPRESSED_BYTES) throw new Error('EPUB 解压后的内容超过 768 MB 上限');
 
             if (name && !name.endsWith('/')) {
                 entries.set(name.toLowerCase(), {
@@ -99,13 +230,13 @@
         }
 
         return {
-            async getBytes(path) {
+            async getBytes(path, { maxBytes = MAX_EPUB_ENTRY_BYTES } = {}) {
                 const entry = entries.get(normalizeZipPath(path).toLowerCase());
                 if (!entry) return null;
-                return extractZipEntry(bytes, view, entry);
+                return extractZipEntry(bytes, view, entry, Math.min(MAX_EPUB_ENTRY_BYTES, Math.max(1, Number(maxBytes) || MAX_EPUB_ENTRY_BYTES)));
             },
-            async getText(path) {
-                const entryBytes = await this.getBytes(path);
+            async getText(path, options = {}) {
+                const entryBytes = await this.getBytes(path, options);
                 if (!entryBytes) return '';
                 return new TextDecoder('utf-8').decode(entryBytes);
             }
@@ -113,6 +244,7 @@
     }
 
     function findEndOfCentralDirectory(view) {
+        if (view.byteLength < 22) throw new Error('EPUB ZIP 文件不完整');
         const minOffset = Math.max(0, view.byteLength - 0xffff - 22);
         for (let offset = view.byteLength - 22; offset >= minOffset; offset -= 1) {
             if (view.getUint32(offset, true) === 0x06054b50) return offset;
@@ -120,7 +252,8 @@
         throw new Error('EPUB ZIP 文件不完整');
     }
 
-    async function extractZipEntry(bytes, view, entry) {
+    async function extractZipEntry(bytes, view, entry, maxBytes = MAX_EPUB_ENTRY_BYTES) {
+        if (entry.uncompressedSize > maxBytes) throw new Error(`EPUB 条目超过 ${Math.round(maxBytes / 1024 / 1024)} MB 上限：${entry.name}`);
         const offset = entry.localHeaderOffset;
         if (view.getUint32(offset, true) !== 0x04034b50) {
             throw new Error(`EPUB ZIP 本地文件头损坏：${entry.name}`);
@@ -129,14 +262,16 @@
         const fileNameLength = view.getUint16(offset + 26, true);
         const extraLength = view.getUint16(offset + 28, true);
         const dataOffset = offset + 30 + fileNameLength + extraLength;
+        if (dataOffset < 0 || dataOffset + entry.compressedSize > bytes.length) throw new Error(`EPUB ZIP 数据越界：${entry.name}`);
         const compressedData = bytes.subarray(dataOffset, dataOffset + entry.compressedSize);
 
         if (entry.compressionMethod === ZIP_STORED) {
+            if (compressedData.length > maxBytes) throw new Error(`EPUB 条目超过大小上限：${entry.name}`);
             return compressedData;
         }
 
         if (entry.compressionMethod === ZIP_DEFLATED) {
-            const inflated = await inflateRaw(compressedData);
+            const inflated = await inflateRaw(compressedData, maxBytes);
             if (entry.uncompressedSize && inflated.length !== entry.uncompressedSize) {
                 return inflated.subarray(0, entry.uncompressedSize);
             }
@@ -146,15 +281,33 @@
         throw new Error(`EPUB 使用了暂不支持的 ZIP 压缩方式：${entry.compressionMethod}`);
     }
 
-    async function inflateRaw(data) {
+    async function inflateRaw(data, maxBytes = MAX_EPUB_ENTRY_BYTES) {
         if (typeof module === 'object' && module.exports && typeof require === 'function') {
             const zlib = require('node:zlib');
-            return new Uint8Array(zlib.inflateRawSync(Buffer.from(data)));
+            return new Uint8Array(zlib.inflateRawSync(Buffer.from(data), { maxOutputLength: maxBytes }));
         }
 
         if (typeof DecompressionStream === 'function') {
             const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
-            return new Uint8Array(await new Response(stream).arrayBuffer());
+            const reader = stream.getReader();
+            const chunks = [];
+            let total = 0;
+            try {
+                while (true) {
+                    const result = await reader.read();
+                    if (result.done) break;
+                    total += result.value.byteLength;
+                    if (total > maxBytes) {
+                        await reader.cancel().catch?.(() => {});
+                        throw new Error('EPUB 解压条目超过大小上限');
+                    }
+                    chunks.push(result.value);
+                }
+            } finally { reader.releaseLock?.(); }
+            const output = new Uint8Array(total);
+            let offset = 0;
+            chunks.forEach(chunk => { output.set(chunk, offset); offset += chunk.byteLength; });
+            return output;
         }
 
         throw new Error('当前浏览器不支持解压 EPUB 中的压缩章节');
@@ -199,14 +352,14 @@
         for (const item of manifest.items) {
             if (item.mediaType === 'application/x-dtbncx+xml' || /\.ncx$/i.test(item.href)) {
                 const ncx = await zip.getText(item.path);
-                parseNcxLabels(ncx, item.path).forEach((label, path) => labels.set(path, label));
+                parseNcxLabels(ncx, item.path).forEach((label, path) => { if (!labels.has(path)) labels.set(path, label); });
             }
         }
 
         for (const item of manifest.items) {
             if (!hasProperty(item, 'nav')) continue;
             const navHtml = await zip.getText(item.path);
-            parseNavLabels(navHtml, item.path).forEach((label, path) => labels.set(path, label));
+            parseNavLabels(navHtml, item.path).forEach((label, path) => { if (!labels.has(path)) labels.set(path, label); });
         }
 
         return labels;
@@ -227,6 +380,77 @@
             }
         }
         return labels;
+    }
+
+    async function parseEpubToc(zip, manifest) {
+        const trees = [];
+        for (const item of manifest.items) {
+            if (item.mediaType === 'application/x-dtbncx+xml' || /\.ncx$/i.test(item.href)) {
+                const ncx = await zip.getText(item.path);
+                if (ncx) trees.push(parseNcxTree(ncx, item.path));
+            }
+        }
+        for (const item of manifest.items) {
+            if (!hasProperty(item, 'nav')) continue;
+            const nav = await zip.getText(item.path);
+            if (nav) trees.push(parseNavTree(nav, item.path));
+        }
+        return trees.flat().filter(Boolean);
+    }
+
+    function parseNcxTree(ncx, ncxPath) {
+        const roots = [];
+        const stack = [];
+        const tokenPattern = /<\/?[^>]+>/g;
+        let token;
+        while ((token = tokenPattern.exec(ncx))) {
+            const value = token[0];
+            if (/^<(?![\/*!])[^>]*\bnavPoint\b[^>]*>$/i.test(value)) {
+                const attrs = parseAttributes(value);
+                const node = { id: attrs.id || `toc-${roots.length}-${stack.length}`, title: '', href: '', fragment: '', children: [] };
+                const closeIndex = ncx.indexOf('</navPoint>', tokenPattern.lastIndex);
+                const navLabelText = ncx.slice(tokenPattern.lastIndex, closeIndex < 0 ? ncx.length : closeIndex).match(/<[^>]*text\b[^>]*>([\s\S]*?)<\/[^>]*text>/i);
+                node.title = decodeHtmlEntities(stripTags(navLabelText?.[1] || '')).trim();
+                if (stack.length) stack[stack.length - 1].children.push(node); else roots.push(node);
+                stack.push(node);
+                continue;
+            }
+            if (/^<\/[^>]*navPoint\s*>$/i.test(value)) { stack.pop(); continue; }
+            if (!stack.length) continue;
+            const current = stack[stack.length - 1];
+            if (/^<[^/][^>]*text\b/i.test(value)) {
+                const end = ncx.indexOf('<', tokenPattern.lastIndex);
+                if (end >= 0) current.title = decodeHtmlEntities(ncx.slice(tokenPattern.lastIndex, end)).trim();
+            }
+            if (/^<[^>]*content\b/i.test(value)) {
+                const attrs = parseAttributes(value);
+                const reference = resolveZipReference(getDirectory(ncxPath), attrs.src || '');
+                current.href = reference.path;
+                current.fragment = reference.fragment;
+            }
+        }
+        return roots;
+    }
+
+    function parseNavTree(navHtml, navPath) {
+        const roots = [];
+        const anchorPattern = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
+        let match;
+        while ((match = anchorPattern.exec(navHtml))) {
+            const attrs = parseAttributes(match[1]);
+            const reference = resolveZipReference(getDirectory(navPath), attrs.href || '');
+            const title = decodeHtmlEntities(stripTags(match[2])).trim();
+            if (title && reference.path) roots.push({ id: `nav-${roots.length}`, title, href: reference.path, fragment: reference.fragment, children: [] });
+        }
+        return roots;
+    }
+
+    function flattenToc(nodes, depth = 0, output = []) {
+        (nodes || []).forEach(node => {
+            output.push({ id: node.id, title: node.title, href: node.href, fragment: node.fragment, depth });
+            flattenToc(node.children, depth + 1, output);
+        });
+        return output;
     }
 
     function parseNavLabels(navHtml, navPath) {
@@ -371,6 +595,13 @@
         return normalizeZipPath(`${baseDir ? `${baseDir}/` : ''}${decodedHref}`);
     }
 
+    function resolveZipReference(baseDir, href) {
+        const raw = String(href || '');
+        const hash = raw.indexOf('#');
+        const fragment = hash >= 0 ? safeDecodeUri(raw.slice(hash + 1)) : '';
+        return { path: resolveZipPath(baseDir, hash >= 0 ? raw.slice(0, hash) : raw), fragment };
+    }
+
     function getDirectory(path) {
         const normalized = normalizeZipPath(path);
         const lastSlash = normalized.lastIndexOf('/');
@@ -412,6 +643,9 @@
 
     return {
         parseEpubToText,
-        htmlToReadableText
+        parseEpubBook,
+        htmlToReadableText,
+        resolveZipPath,
+        resolveZipReference
     };
 });
