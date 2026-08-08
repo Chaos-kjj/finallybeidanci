@@ -16,6 +16,7 @@ This matrix defines evidence required before each future task may merge into `re
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | I1 — Reconstruction CI | REQUIRED | NOT REQUIRED | REQUIRED | DEFERRED | DEFERRED | NOT REQUIRED | NOT REQUIRED | NOT REQUIRED |
 | V1 — Historical legacy fields | REQUIRED | REQUIRED | REQUIRED | NOT REQUIRED | REQUIRED | NOT REQUIRED | REQUIRED | REQUIRED |
+| V1-F1 — Legacy Identity and Occurrence Compatibility | REQUIRED | REQUIRED | REQUIRED | REQUIRED | NOT REQUIRED | NOT REQUIRED | REQUIRED | REQUIRED |
 | R2 — Safe backup merge | REQUIRED | REQUIRED | REQUIRED | NOT REQUIRED | REQUIRED | NOT REQUIRED | REQUIRED | REQUIRED |
 | R1 — Persistent text anchor | REQUIRED | REQUIRED | REQUIRED | NOT REQUIRED | REQUIRED | NOT REQUIRED | REQUIRED | REQUIRED |
 | R3 — StarDict field compatibility | REQUIRED | REQUIRED | REQUIRED | NOT REQUIRED | REQUIRED | NOT REQUIRED | NOT REQUIRED | REQUIRED |
@@ -32,6 +33,7 @@ This matrix defines evidence required before each future task may merge into `re
 ### Unit tests
 
 - **I1:** validate that pull requests run the current Node automated tests and that a failing test produces a failed check.
+- **V1-F1:** cover trusted SHA conversion, `bookKey`-only recovery, mismatched-identity fail-closed behavior, fallback matching, occurrence preservation/resolution, additive repair, unchanged current data, backup round-trip, and reopen persistence.
 - Every activated recovery starts with a regression against A's current API and finishes with the complete existing test suite.
 - A newly added test must not replace, relax, skip, or disable an existing regression.
 - B1/B2 and other non-Web tasks still require the full repository suite through the canonical delivery gate.
@@ -39,6 +41,7 @@ This matrix defines evidence required before each future task may merge into `re
 ### Integration tests
 
 - **V1:** migrate historically representative records and compare source identity, annotation data, and current-model output.
+- **V1-F1:** exercise fresh migration, already-migrated additive repair, repair idempotency, missing-legacy-DB no-op, re-import identity continuity, and backup/restore as complete compatibility paths.
 - **R2:** exercise decode/preview/build-dataset/merge/atomic-apply/rollback as one restore path.
 - **R1:** exercise selection, persistence, simulated restart, lazy EPUB resolution, PDF text-page resolution, and repaint/navigation.
 - **R3:** import a complete minimal StarDict fixture and verify normalized lookup output.
@@ -51,12 +54,14 @@ This matrix defines evidence required before each future task may merge into `re
 
 - `npm run build` remains the canonical delivery command and includes the complete tests, offline scan, Web asset rebuild/sync, Android APK assembly, and APK freshness verification.
 - Product-code tasks continue to require the canonical delivery command, even when the behavior under test lives primarily on one platform.
+- V1-F1 does not require Android build as a separate task-specific validation category; the repository's canonical delivery command remains required and still assembles and verifies the debug APK.
 - I1 Phase 1 separately verifies that reconstruction pull requests automatically run the production Web build and fail when it fails. Android build is DEFERRED in I1's initial CI scope and must not be presented as an existing required CI gate.
 - The Phase 0 governance draft explicitly forbids running a build before owner review; its current documentation-only state is not product delivery evidence.
 
 ### Android lint
 
 - Required for Android-native changes and for the B1/B2 lint-baseline task.
+- Required for V1-F1 as a current reconstruction CI gate even though V1-F1 has no Android-native implementation scope.
 - I1 Phase 1 records Android lint as DEFERRED while B1/B2 remain known baseline failures; it must not pretend lint is green or make the current failure an ignored required check.
 - A lint baseline, suppression, ignored error, `continue-on-error`, reduced severity, or a raised `minSdk` is not an acceptable substitute for fixing B1/B2.
 - After B1/B2 correctly resolve `MissingSuperCall` and the API-23 compatibility error, Android lint must be promoted into reconstruction CI as a required check whose failure fails the check.
@@ -71,6 +76,7 @@ This matrix defines evidence required before each future task may merge into `re
 ### Data migration validation
 
 - **V1:** validate all three historical fields and all seven contract questions using authentic evidence where available.
+- **V1-F1:** validate trusted and mismatched identity conversion, exact legacy fallback comparison, raw occurrence retention/resolution state, fresh and repaired migrations, re-import continuity, unchanged native DB6 data, and backup round-trip.
 - **R2:** validate data-only merge, complete-file replacement, safety snapshot, and rollback without loss.
 - **R1:** validate new anchor persistence together with old anchorless notes and any V1-approved compatibility result.
 - No task may erase an original legacy field merely because the current model does not yet understand it.
@@ -79,6 +85,7 @@ This matrix defines evidence required before each future task may merge into `re
 
 - Manual validation supplements, never replaces, automated regressions.
 - R1 must cover actual note navigation in EPUB and PDF samples.
+- V1-F1 must cover representative migration, repair, re-import, reopen, occurrence navigation/removal, and normal/complete backup restore behavior without identity or annotation separation.
 - R2 must cover preview wording and normal-versus-complete restore choice.
 - R3/R4 must cover representative import, lookup, progress, cancellation, and retry flows.
 - R5 must cover visible study, idle, background, and resume behavior.
