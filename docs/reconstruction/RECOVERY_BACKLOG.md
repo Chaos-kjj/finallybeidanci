@@ -20,7 +20,7 @@ The work is intentionally not ordered by the R-number labels.
 | Lane | Classification and sequence | Reason |
 | --- | --- | --- |
 | Infrastructure gate | I1 before product-code implementation merge workflows — SATISFIED | I1 has no recovery hard dependency. Its product-code merge hard gate is satisfied, and the current required checks are Node tests, Web production build, and Android lint. |
-| Historical data gate | V1 before R1 is RECOMMENDED SEQUENCING; V1 is a HARD GATE FOR FINAL RECONSTRUCTION ACCEPTANCE | R1 can use A's current fingerprint and annotation model independently. Earlier V1 evidence reduces compatibility rework, while final reconstruction still cannot enter `main` without a V1 conclusion. |
+| Historical data gate | V1 validation is DONE; V1-F1 is a HARD GATE FOR FINAL RECONSTRUCTION ACCEPTANCE; V1-F1 and R1 have a DESIGN CONSTRAINT / RECOMMENDED SEQUENCING relationship | V1 concluded `PASS — IMPLEMENTATION TASK REQUIRED`. R1 and V1-F1 may be implemented independently, but final reconstruction cannot enter `main` until V1-F1 is complete. |
 | Data safety and reader | R2 before R1 is RECOMMENDED SEQUENCING | R2 is a small, high-value data-loss fix. Both tasks touch storage, `src/main.js`, and nearby tests, so ordering reduces conflicts; R2 is not a semantic prerequisite for R1. |
 | Dictionary | R3 before R4 is RECOMMENDED SEQUENCING | R4 can be designed and validated against A's current StarDict semantics. R3 first merely reduces repeated edits and conflicts in `stardict-provider` and `import-service`. |
 | Study timing | R5 independently after I1 | Its primary logic is isolated in study statistics and lifecycle wiring. |
@@ -33,10 +33,11 @@ Parallel work is safe only across separate lanes and separate worktrees. Recomme
 ## Task inventory
 
 - Before I1 was added, the backlog contained 11 formal task records.
-- With I1, the backlog contains 12 formal task records: I1, V1, R1–R6, the combined B1/B2 lint-baseline record, B3, B4, and O1.
+- With I1, the backlog contained 12 formal task records: I1, V1, R1–R6, the combined B1/B2 lint-baseline record, B3, B4, and O1.
+- With V1-F1, the backlog contains 13 formal task records: I1, V1, V1-F1, R1–R6, the combined B1/B2 lint-baseline record, B3, B4, and O1.
 - B1 and B2 remain two known finding identifiers represented by one formal **Android lint baseline** task record and one pull-request boundary.
-- O1 is a formal optional/deferred task record. It is counted in the 12 records but does not block canonical reconstruction.
-- Raw identifiers and formal task-record counts differ: I1, V1, R1–R6, B1, B2, B3, B4, and O1 are 13 identifiers represented by 12 task records because B1/B2 are combined.
+- O1 is a formal optional/deferred task record. It is counted in the 13 records but does not block canonical reconstruction.
+- Raw identifiers and formal task-record counts differ: I1, V1, V1-F1, R1–R6, B1, B2, B3, B4, and O1 are 14 identifiers represented by 13 task records because B1/B2 are combined.
 
 ## Infrastructure gate
 
@@ -115,65 +116,148 @@ Parallel work is safe only across separate lanes and separate worktrees. Recomme
 
 ## Historical data gate
 
-### V1 — Historical legacy field validation
+### V1 — Historical Legacy Migration Validation
 
-**Status:** MUST VALIDATE BEFORE FINAL MERGE — NOT STARTED
+**Status:** DONE — VALIDATION COMPLETE
 
-**Scope**
+**Final validation conclusion**
 
-- Determine the historical semantics and safe disposition of `bookKey`, `fileHash`, and `highlightedOccurrences`.
-- Answer all seven questions in the reconstruction contract.
-- Validation is the entire PR boundary. Do not add a runtime migration in the validation PR; open a separate approved implementation item if evidence requires one.
+- V1 GATE: **PASS — IMPLEMENTATION TASK REQUIRED**.
+- The investigation and validation of `bookKey`, `fileHash`, and `highlightedOccurrences` are complete.
+- The final reconstruction acceptance hard gate is not yet satisfied. Its remaining condition is completion of the separate V1-F1 implementation task.
 
-**Source evidence**
+**Source evidence and field disposition**
 
-- Historical production writers that emitted `bookKey`, `fileHash`, and `highlightedOccurrences`.
-- A's current `normalizeLegacyBook` path, which does not retain these fields.
-- Real production database/backup samples when available; synthetic fixtures must be labeled synthetic.
+1. `bookKey`
+   - Historical normal form: `hash:<fileHash>`.
+   - It participated in source identity, progress identity, annotation/source association, and file association.
+   - Final disposition: **CONVERSION REQUIRED**.
+2. `fileHash`
+   - Historical normal algorithm: SHA-256 over the complete original source bytes.
+   - Historical `fallback-*` identities also exist.
+   - Final disposition: **LEGACY COMPATIBILITY REQUIRED**.
+   - Hashing migrated cleaned text must never be used to fabricate the historical source fingerprint.
+3. `highlightedOccurrences`
+   - Historical structure: `string[]`, with each element encoded as `paragraphIndex:wordIndex`.
+   - It is a per-book persistent errata occurrence, not a note, bookmark, R1 anchor, temporary selection, or global vocabulary item.
+   - It historically drove reader highlighting, the per-book occurrence list, context snippets, navigation, and individual occurrence removal.
+   - Final disposition: **LEGACY COMPATIBILITY REQUIRED**.
 
-**Target modules**
+**Completed validation boundary**
 
-- Investigation: `src/storage/local-store.js`, `src/reader/book-library.js`, and current annotation/source-identity paths.
-- Regression fixtures and `tests/local-storage-migration.test.js` may be extended to demonstrate proven behavior.
-- No runtime target is approved until validation reaches a documented conclusion.
+- All seven reconstruction-contract questions were answered for all three historical fields.
+- The validation PR did not add runtime migration behavior; its implementation result is captured separately as V1-F1.
+- V1 before R1 was recommended sequencing, not a hard dependency. R1 remains independently implementable.
 
-**Tests required**
+**Risk:** HIGH — an incorrect disposition can permanently lose historical user data or create false book identity matches.
 
-- Fixture-backed migration tests for each historically written field.
-- A before/after record comparison showing whether current models preserve, convert, ignore, or lose the field.
-- Duplicate/source-identity tests for `bookKey` and `fileHash` if evidence shows they are functional.
-- Annotation behavior tests for `highlightedOccurrences` if evidence shows a current equivalent.
-
-**Acceptance criteria**
-
-- Each field has a documented historical meaning and evidence citation.
-- Each field is mapped to one of: safe conversion, one-time compatibility read, proven obsolete, or unresolved.
-- Any data-loss decision states its user-visible consequences.
-- Any needed implementation is captured as a separate, bounded follow-up; no speculative preservation is merged.
-
-**Dependencies**
-
-- The V1 evidence-validation task has no recovery hard dependency.
-- V1 before R1 is RECOMMENDED SEQUENCING because earlier identity/annotation evidence may reduce later compatibility rework; V1 does not block R1 design, implementation, or merge into the reconstruction integration branch.
-- Any V1 follow-up that modifies product code has I1 Phase 1 as a HARD GATE FOR PRODUCT-CODE MERGE WORKFLOW.
-- V1 is a HARD GATE FOR FINAL RECONSTRUCTION ACCEPTANCE and must have an explicit conclusion before reconstruction may enter `main`.
-
-**Risk:** HIGH — an incorrect conclusion can permanently lose historical user data or create false book identity matches.
-
-**Rollback**
-
-- Keep the validation PR non-mutating for production data.
-- Revert only its fixtures/documentation if evidence is disproven.
-- Any future migration must define its own rollback and retain the original record until conversion succeeds atomically.
-
-**PR boundary:** `validation/v1-legacy-fields`; validation evidence and tests only.
+**PR boundary:** `validation/v1-legacy-fields`; completed validation evidence and tests only.
 
 **Definition of Done**
 
-- All seven contract questions are answered for all three fields.
-- Data migration validation in the matrix is complete.
-- Product-owner review accepts the disposition or explicitly records an unresolved blocker.
-- R1 may proceed independently, but final reconstruction acceptance and the final pull request into `main` remain blocked until V1 has an explicit completed conclusion.
+- V1 investigation and validation are complete.
+- V1 reached the explicit gate result `PASS — IMPLEMENTATION TASK REQUIRED`.
+- The required implementation is bounded by V1-F1 rather than being folded into the completed validation task.
+
+### V1-F1 — Legacy Identity and Occurrence Compatibility
+
+**Status:** REQUIRED
+
+**Final reconstruction gate:** REQUIRED BEFORE FINAL RECONSTRUCTION ACCEPTANCE
+
+**Scope**
+
+#### A. Trusted SHA identity conversion
+
+- When legacy `fileHash` is strictly a 64-hex SHA-256 value, convert it to the current `fingerprint` and normalize it to lowercase.
+
+#### B. `bookKey` recovery
+
+- If `fileHash` is absent but `bookKey` strictly matches `hash:<64hex>`, recover the current `fingerprint` from its digest and normalize it to lowercase.
+- If both `fileHash` and the `bookKey` digest exist, they must agree.
+- A mismatch must fail closed; the implementation must not guess.
+
+#### C. Legacy fallback identity
+
+- Never fabricate a current fingerprint from a historical `fallback-*` identity.
+- Preserve a compatibility identity.
+- When the user later provides the source file again, allow an identity match only by exactly reproducing the historical comparator over bytes, size, and `lastModified`.
+
+#### D. `highlightedOccurrences`
+
+- Preserve the original legacy occurrence data.
+- Allow a compatibility reader to resolve valid occurrences with the historical paragraph-splitting and English-tokenization rules.
+- Retain malformed or unresolvable raw values and mark them unresolved.
+- Never guess nearby text, highlight the wrong text, or delete a historical value.
+
+#### E. Already-migrated repair
+
+- Support users whose `legacy-migration-v1` migration is already marked complete while the old legacy IndexedDB still exists.
+- Perform an idempotent, additive DB6 repair keyed by the historical book ID.
+- If the legacy database no longer exists, safely no-op.
+- Never guess a repair target.
+
+#### F. Re-import compatibility
+
+- Re-importing the same historical source must not create a duplicate book or separate its progress, notes, bookmarks, or legacy occurrences because identity was lost.
+
+#### G. Backup round-trip
+
+- Preserve recoverable V1 compatibility data through normal backup, complete backup, and restore.
+- Do not implement or alter R2 Safe Backup Merge as part of V1-F1.
+
+**Explicitly out of scope**
+
+- R1 Persistent Anchor.
+- R2 Safe Backup Merge.
+- R3, R4, R5, and R6.
+- Foliate, FSRS, architecture refactoring, new dependencies, or a large product-UI change.
+- Wholesale copying of the old `app.js` or old local-store implementation.
+- Converting `highlightedOccurrences` into an R1 anchor, note, bookmark, or global vocabulary replacement.
+
+**R1 relationship**
+
+- V1-F1 ↔ R1 is a **DESIGN CONSTRAINT / RECOMMENDED SEQUENCING** relationship, not a hard dependency.
+- R1 must accept a trusted migration fingerprint, support anchorless legacy notes, avoid treating `highlightedOccurrences` as an anchor, and accept V1 additive state.
+- R1 and V1-F1 may be implemented independently.
+
+**Dependencies**
+
+- The V1 evidence-validation task is complete and supplies V1-F1's approved behavior boundary.
+- I1's product-code merge hard gate is **SATISFIED**; current reconstruction required checks are Node tests, Web production build, and Android lint.
+- V1-F1 is a **HARD GATE FOR FINAL RECONSTRUCTION ACCEPTANCE** and must complete before reconstruction may enter `main`.
+
+**Risk:** HIGH — false identity conversion can merge unrelated books, while dropped compatibility state can irreversibly separate or lose historical user data.
+
+**Rollback**
+
+- Keep migration and repair additive and idempotent.
+- Retain original legacy identity and occurrence values so reverting the implementation does not require destructive data rewriting.
+- Never delete compatibility data merely because a value cannot currently be resolved.
+
+**PR boundary:** one dedicated V1-F1 implementation branch and pull request; no adjacent recovery or product work.
+
+**Definition of Done**
+
+1. Trusted SHA identity migration passes.
+2. `bookKey`-only recovery passes.
+3. Mismatched identities fail closed.
+4. Legacy fallback compatibility matches an identical source and rejects a different source.
+5. Original occurrence data is preserved.
+6. Valid occurrences resolve under the historical rules.
+7. Malformed occurrences are retained but marked unresolved.
+8. Fresh legacy migration passes.
+9. Already-migrated repair passes.
+10. Repair is idempotent.
+11. A missing legacy database safely no-ops.
+12. Existing native DB6 books remain unchanged.
+13. Notes remain unchanged.
+14. Bookmarks remain unchanged.
+15. Progress remains unchanged.
+16. Global errata/vocabulary data is neither duplicated nor rewritten.
+17. Compatibility data survives backup round-trip.
+18. Compatibility behavior remains after reopen.
+19. All current reconstruction required checks pass.
 
 ## Data safety and reader lane
 
