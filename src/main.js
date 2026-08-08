@@ -14,6 +14,7 @@ import './core/sanitize-html.js';
 import './core/clipboard.js';
 import './core/learning.js';
 import './core/study-stats.js';
+import './core/legacy-v1-compatibility.js';
 import './storage/secure-key-store.js';
 import './storage/local-store.js';
 import './storage/backup.js';

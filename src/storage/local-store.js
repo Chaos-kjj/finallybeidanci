@@ -1,9 +1,14 @@
 (function (root, factory) {
-    const api = factory(root?.KangkangCore || {}, root?.KangkangSecure || {});
+    const compatibility = typeof module === 'object' && module.exports
+        ? require('../core/legacy-v1-compatibility.js')
+        : root?.KangkangLegacyV1 || {};
+    const api = factory(root?.KangkangCore || {}, root?.KangkangSecure || {}, compatibility);
     if (typeof module === 'object' && module.exports) module.exports = api;
     if (root) root.KangkangStorage = { ...(root.KangkangStorage || {}), ...api };
-})(typeof globalThis !== 'undefined' ? globalThis : this, function (core, secure) {
+})(typeof globalThis !== 'undefined' ? globalThis : this, function (core, secure, legacyV1) {
     const DB_NAME = 'kangkang-local-db';
+    const LEGACY_READER_DB_NAME = 'kangkangWordPwa_readerDb';
+    const LEGACY_V1_REPAIR_MARKER_ID = 'legacy-v1-f1-data-preservation-v1';
     // Never lower this number. Android upgrades can leave an IndexedDB v5
     // database behind even when the WebView is loading an older web bundle.
     // Opening with a lower requested version throws VersionError before any
@@ -259,14 +264,19 @@
         async migrateLegacy({ legacyStorage = this.legacyStorage, legacyIndexedDB = globalThis.indexedDB } = {}) {
             await this.open();
             const marker = await this.get('meta', 'legacy-migration-v1');
-            if (marker?.completedAt) return { migrated: false, alreadyDone: true, apiKeyNeedsMigration: false };
+            if (marker?.completedAt) {
+                const repair = await this.repairLegacyV1Data({ legacyIndexedDB });
+                return { migrated: false, alreadyDone: true, apiKeyNeedsMigration: false, repair };
+            }
 
             const oldState = parseStorage(legacyStorage, 'kangkangWordPwa_state_v1');
             const oldAiConfig = parseStorage(legacyStorage, 'mySmartWordBook_aiConfig');
             const oldDefinitionCache = parseStorage(legacyStorage, 'kangkangWordPwa_definitionCache_v1');
             const oldReaderSettings = parseStorage(legacyStorage, 'kangkangWordPwa_readerSettings_v1');
             const oldReaderProgress = parseStorage(legacyStorage, 'kangkangWordPwa_readerProgress_v1');
-            const oldBooks = await readLegacyBooks(legacyIndexedDB);
+            const legacySource = await readLegacyBooksIfExists(legacyIndexedDB);
+            const oldBooks = legacySource.books;
+            const preparedBooks = oldBooks.map(book => legacyV1.prepareLegacyV1Book(book));
             const apiKey = String(oldAiConfig?.apiKey || '');
             let apiKeyNeedsMigration = false;
             if (apiKey && !this.secureKeyStore?.isNative) apiKeyNeedsMigration = true;
@@ -276,7 +286,14 @@
             const normalizedState = oldState && typeof oldState === 'object' ? { ...oldState, schemaVersion: DB_VERSION } : { schemaVersion: DB_VERSION };
             const safeAiConfig = oldAiConfig && typeof oldAiConfig === 'object' ? { ...oldAiConfig } : null;
             if (safeAiConfig) delete safeAiConfig.apiKey;
-            const migratedBooks = oldBooks.map(book => normalizeLegacyBook(book, oldReaderProgress));
+            const migratedBooks = oldBooks.map((book, index) => normalizeLegacyBook(book, oldReaderProgress, preparedBooks[index]));
+            const freshRepairMarker = legacySource.exists ? buildLegacyV1RepairMarker({
+                processedIds: preparedBooks.map(item => item.id).filter(Boolean),
+                repairedIds: migratedBooks.map(book => book.id),
+                skipped: preparedBooks.filter(item => !item.id).map(() => ({ id: '', reason: 'invalid-legacy-id' })),
+                conflictIds: preparedBooks.filter(hasPreparedIdentityConflict).map(item => item.id).filter(Boolean),
+                completedAt: migratedAt
+            }) : null;
 
             // IndexedDB transactions must not await between requests. Keep
             // the complete legacy snapshot, state, metadata and book rows in
@@ -290,6 +307,7 @@
                 if (oldDefinitionCache && typeof oldDefinitionCache === 'object') targets.meta.put({ id: 'definition-cache', data: oldDefinitionCache, updatedAt: migratedAt });
                 if (safeAiConfig) targets.meta.put({ id: 'ai-config', data: safeAiConfig, updatedAt: migratedAt });
                 migratedBooks.forEach(book => targets.books.put(book));
+                if (freshRepairMarker) targets.meta.put(freshRepairMarker);
             });
 
             if (apiKey && !apiKeyNeedsMigration) {
@@ -308,6 +326,30 @@
             }
             await this.put('meta', { id: 'legacy-migration-v1', schemaVersion: 1, completedAt: new Date().toISOString(), sourceKeys: ['kangkangWordPwa_state_v1', 'mySmartWordBook_aiConfig', 'kangkangWordPwa_definitionCache_v1', 'kangkangWordPwa_readerSettings_v1', 'kangkangWordPwa_readerProgress_v1', 'kangkangWordPwa_readerDb/books'], apiKeyNeedsMigration });
             return { migrated: true, alreadyDone: false, apiKeyNeedsMigration };
+        }
+
+        async repairLegacyV1Data({ legacyIndexedDB = globalThis.indexedDB } = {}) {
+            await this.open();
+            const marker = await this.get('meta', LEGACY_V1_REPAIR_MARKER_ID);
+            if (marker?.completedAt) {
+                return { repaired: false, alreadyDone: true, legacyDatabaseMissing: false, marker };
+            }
+
+            // Phase 1 is entirely outside DB6: probe without creating, read in
+            // one readonly transaction, clone, wait for completion, and close.
+            const legacySource = await readLegacyBooksIfExists(legacyIndexedDB);
+            if (!legacySource.exists) {
+                return { repaired: false, alreadyDone: false, legacyDatabaseMissing: true };
+            }
+            const preparedBooks = legacySource.books.map(book => legacyV1.prepareLegacyV1Book(book));
+
+            // Phase 2 owns one independent DB6 transaction. The real
+            // IndexedDB path is request/event driven so it never awaits while
+            // the transaction is active.
+            const repair = this.backend
+                ? await commitMemoryLegacyV1Repair(this, preparedBooks)
+                : await commitIndexedDbLegacyV1Repair(this.db, preparedBooks);
+            return { repaired: true, alreadyDone: false, legacyDatabaseMissing: false, ...repair };
         }
     }
 
@@ -348,19 +390,217 @@
         } catch (_) { return null; }
     }
 
-    function readLegacyBooks(indexedDBRef) {
-        if (!indexedDBRef) return Promise.resolve([]);
-        return new Promise(resolve => {
-            let request;
-            try { request = indexedDBRef.open('kangkangWordPwa_readerDb'); } catch (_) { resolve([]); return; }
-            request.onerror = () => resolve([]);
-            request.onsuccess = () => {
-                const db = request.result;
-                if (!db.objectStoreNames.contains('books')) { db.close(); resolve([]); return; }
-                const get = db.transaction('books', 'readonly').objectStore('books').getAll();
-                get.onsuccess = () => { const books = get.result || []; db.close(); resolve(books); };
-                get.onerror = () => { db.close(); resolve([]); };
+    async function readLegacyBooksIfExists(indexedDBRef) {
+        if (!indexedDBRef) return { exists: false, books: [] };
+        if (typeof indexedDBRef.databases === 'function') {
+            try {
+                const databases = await indexedDBRef.databases();
+                if (Array.isArray(databases) && !databases.some(item => item?.name === LEGACY_READER_DB_NAME)) {
+                    return { exists: false, books: [] };
+                }
+            } catch (_) {
+                // Older WebViews may expose but not implement databases().
+                // The abort-on-upgrade probe below remains non-creating.
+            }
+        }
+
+        const db = await openExistingLegacyDatabase(indexedDBRef);
+        if (!db) return { exists: false, books: [] };
+        if (!db.objectStoreNames.contains('books')) {
+            db.close();
+            return { exists: true, books: [] };
+        }
+
+        return new Promise((resolve, reject) => {
+            let transaction;
+            let books = [];
+            let requestError = null;
+            let closed = false;
+            const close = () => {
+                if (closed) return;
+                closed = true;
+                db.close();
             };
+            try {
+                transaction = db.transaction('books', 'readonly');
+                const request = transaction.objectStore('books').getAll();
+                request.onsuccess = () => {
+                    try { books = structuredCloneSafe(request.result || []); }
+                    catch (error) { requestError = error; try { transaction.abort(); } catch (_) { /* noop */ } }
+                };
+                request.onerror = () => { requestError = request.error || new Error('旧版书籍读取失败'); };
+                transaction.oncomplete = () => { close(); resolve({ exists: true, books }); };
+                transaction.onerror = () => { requestError ||= transaction.error || new Error('旧版书籍读取事务失败'); };
+                transaction.onabort = () => { close(); reject(requestError || transaction.error || new Error('旧版书籍读取事务已回滚')); };
+            } catch (error) {
+                close();
+                reject(error);
+            }
+        });
+    }
+
+    function openExistingLegacyDatabase(indexedDBRef) {
+        return new Promise((resolve, reject) => {
+            let request;
+            let missing = false;
+            let settled = false;
+            const finish = (error, db = null) => {
+                if (settled) return;
+                settled = true;
+                if (error) reject(error);
+                else resolve(db);
+            };
+            try { request = indexedDBRef.open(LEGACY_READER_DB_NAME); }
+            catch (error) { finish(error); return; }
+            request.onupgradeneeded = () => {
+                missing = true;
+                try { request.transaction?.abort(); }
+                catch (error) { finish(error); }
+            };
+            request.onsuccess = () => {
+                if (missing) {
+                    request.result?.close?.();
+                    finish(null, null);
+                    return;
+                }
+                finish(null, request.result);
+            };
+            request.onerror = () => {
+                if (missing || request.error?.name === 'AbortError') finish(null, null);
+                else finish(request.error || new Error('旧版数据库探测失败'));
+            };
+            request.onblocked = () => finish(new Error('旧版数据库被其他页面占用'));
+        });
+    }
+
+    function hasPreparedIdentityConflict(prepared) {
+        return prepared?.legacyV1?.identityKind === 'conflict'
+            || (prepared?.legacyV1?.conflicts?.identities || []).length > 0;
+    }
+
+    function createRepairDiagnostics() {
+        return { processedIds: [], repairedIds: [], skipped: [], conflictIds: [] };
+    }
+
+    function addUniqueId(target, id) {
+        if (id && !target.includes(id)) target.push(id);
+    }
+
+    function processRepairCandidate(currentBook, prepared, diagnostics, putBook) {
+        if (!prepared.id) {
+            diagnostics.skipped.push({ id: '', reason: 'invalid-legacy-id' });
+            return;
+        }
+        addUniqueId(diagnostics.processedIds, prepared.id);
+        if (!currentBook) {
+            diagnostics.skipped.push({ id: prepared.id, reason: 'target-missing' });
+            return;
+        }
+        const outcome = legacyV1.reconcileLegacyV1Book(currentBook, prepared);
+        if (outcome.changed) {
+            putBook(outcome.book);
+            addUniqueId(diagnostics.repairedIds, prepared.id);
+        }
+        if (outcome.hasConflicts) addUniqueId(diagnostics.conflictIds, prepared.id);
+    }
+
+    function normalizedDiagnostics(diagnostics) {
+        const byText = (left, right) => String(left).localeCompare(String(right));
+        return {
+            processedIds: [...new Set(diagnostics.processedIds)].sort(byText),
+            repairedIds: [...new Set(diagnostics.repairedIds)].sort(byText),
+            skipped: diagnostics.skipped
+                .map(item => ({ id: String(item.id || ''), reason: String(item.reason || '') }))
+                .sort((left, right) => byText(left.id, right.id) || byText(left.reason, right.reason)),
+            conflictIds: [...new Set(diagnostics.conflictIds)].sort(byText)
+        };
+    }
+
+    function buildLegacyV1RepairMarker({ processedIds = [], repairedIds = [], skipped = [], conflictIds = [], completedAt = new Date().toISOString() } = {}) {
+        const diagnostics = normalizedDiagnostics({ processedIds, repairedIds, skipped, conflictIds });
+        return {
+            id: LEGACY_V1_REPAIR_MARKER_ID,
+            schemaVersion: 1,
+            completedAt,
+            sourceDatabase: LEGACY_READER_DB_NAME,
+            ...diagnostics,
+            counts: {
+                processed: diagnostics.processedIds.length,
+                repaired: diagnostics.repairedIds.length,
+                skipped: diagnostics.skipped.length,
+                conflicts: diagnostics.conflictIds.length
+            }
+        };
+    }
+
+    async function commitMemoryLegacyV1Repair(store, preparedBooks) {
+        const diagnostics = createRepairDiagnostics();
+        let marker = null;
+        await store.transaction(['books', 'meta'], targets => {
+            for (const prepared of preparedBooks) {
+                const currentBook = prepared.id ? targets.books.get(prepared.id) : null;
+                processRepairCandidate(currentBook, prepared, diagnostics, book => targets.books.put(book));
+            }
+            marker = buildLegacyV1RepairMarker(diagnostics);
+            targets.meta.put(marker);
+        });
+        return { marker };
+    }
+
+    function commitIndexedDbLegacyV1Repair(db, preparedBooks) {
+        return new Promise((resolve, reject) => {
+            const diagnostics = createRepairDiagnostics();
+            let transaction;
+            let marker = null;
+            let failure = null;
+            let settled = false;
+            const finish = (error, value) => {
+                if (settled) return;
+                settled = true;
+                if (error) reject(error);
+                else resolve(value);
+            };
+            try {
+                transaction = db.transaction(['books', 'meta'], 'readwrite');
+                const books = transaction.objectStore('books');
+                const meta = transaction.objectStore('meta');
+                const valid = preparedBooks.filter(prepared => {
+                    if (prepared.id) return true;
+                    diagnostics.skipped.push({ id: '', reason: 'invalid-legacy-id' });
+                    return false;
+                });
+                let pending = valid.length;
+                const queueMarker = () => {
+                    marker = buildLegacyV1RepairMarker(diagnostics);
+                    meta.put(marker);
+                };
+
+                transaction.oncomplete = () => finish(null, { marker });
+                transaction.onerror = () => { failure ||= transaction.error || new Error('V1-F1A 修复事务失败'); };
+                transaction.onabort = () => finish(failure || transaction.error || new Error('V1-F1A 修复事务已回滚'));
+
+                if (!pending) {
+                    queueMarker();
+                    return;
+                }
+                for (const prepared of valid) {
+                    const request = books.get(prepared.id);
+                    request.onsuccess = () => {
+                        try {
+                            processRepairCandidate(request.result || null, prepared, diagnostics, book => books.put(book));
+                            pending -= 1;
+                            if (!pending) queueMarker();
+                        } catch (error) {
+                            failure = error;
+                            try { transaction.abort(); } catch (_) { finish(error); }
+                        }
+                    };
+                    request.onerror = () => { failure = request.error || new Error(`V1-F1A target read failed: ${prepared.id}`); };
+                }
+            } catch (error) {
+                try { transaction?.abort(); } catch (_) { /* noop */ }
+                finish(error);
+            }
         });
     }
 
@@ -389,11 +629,12 @@
         };
     }
 
-    function normalizeLegacyBook(book, legacyReaderProgress = null) {
+    function normalizeLegacyBook(book, legacyReaderProgress = null, preparedLegacyV1 = null) {
         const rawProgress = book.progress || { flow: 'scroll', pageIndex: 0, percent: 0, updatedAt: null };
         const legacyKey = `id:${book.id}`;
         const progressOverride = legacyReaderProgress?.books?.[legacyKey] || legacyReaderProgress?.[legacyKey];
-        return {
+        const prepared = preparedLegacyV1 || legacyV1.prepareLegacyV1Book(book);
+        const normalized = {
             id: String(book.id || `${Date.now()}-${Math.random().toString(36).slice(2)}`),
             title: String(book.title || book.fileName || '未命名书籍'),
             type: String(book.type || 'text'),
@@ -404,13 +645,17 @@
             notes: Array.isArray(book.notes) ? book.notes : [],
             bookmarks: Array.isArray(book.bookmarks) ? book.bookmarks : [],
             createdAt: Number(book.createdAt) || Date.now(),
-            updatedAt: Number(book.updatedAt) || Date.now()
+            updatedAt: Number(book.updatedAt) || Date.now(),
+            legacyV1: structuredCloneSafe(prepared.legacyV1)
         };
+        if (prepared.fingerprint) normalized.fingerprint = prepared.fingerprint;
+        if (prepared.occurrences.present) normalized.highlightedOccurrences = structuredCloneSafe(prepared.occurrences.raw);
+        return normalized;
     }
 
     return {
-        DB_NAME, DB_VERSION, STORES, LocalStore, MemoryBackend, upgradeDatabase,
+        DB_NAME, DB_VERSION, STORES, LEGACY_V1_REPAIR_MARKER_ID, LocalStore, MemoryBackend, upgradeDatabase,
         migrateV4ToV5, migrateV5ToV6, normalizeLegacyBook, normalizeReaderProgress,
-        classifyOpenFailure
+        classifyOpenFailure, readLegacyBooksIfExists
     };
 });
