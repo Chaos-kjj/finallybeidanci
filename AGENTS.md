@@ -46,6 +46,11 @@
   - `fix/android-lint-baseline`
   - `infra/reconstruction-ci`
 
+## Reconstruction operator
+
+- Use `.agents/skills/reconstruction-operator/SKILL.md` (`reconstruction-operator`) by default for every reconstruction task's complete Git and GitHub lifecycle.
+- Automate every safe operation available through `git`, `gh`, the GitHub REST API, or GitHub Actions; pause only for the skill's explicit escalation conditions.
+
 ## Change Discipline
 
 - A behavior-preserving recovery must not change unrelated product behavior.
