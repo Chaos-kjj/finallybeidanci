@@ -31,8 +31,8 @@ If this file conflicts with live state or frozen governance/evidence, report `DU
 | --- | --- |
 | Repository | `Chaos-kjj/finallybeidanci` |
 | Reconstruction integration branch | `reconstruction/canonical-2026-08-07` |
-| Last verified integration SHA | `533119d74d7a48028266100c3e8b06e1f7007fbc` |
-| Last verified at | `2026-08-09T12:33:05+08:00` |
+| Last verified integration SHA | `dd8e2e17b486a912d8c9d2fa9b572faf28121f46` |
+| Last verified at | `2026-08-09T22:00:49+08:00` |
 | Verification source | Fresh `git fetch origin`, `origin/reconstruction/canonical-2026-08-07`, merged PR and exact-SHA CI inspection |
 | `main` | Frozen legacy production release; live ref last verified at `16dab7914bf9cfa600a84bb7baca1d9fe89dbd3d` |
 | `rescue/*` | Immutable evidence; live remote rescue refs were present and unchanged at the verification time |
@@ -49,7 +49,7 @@ The live GitHub ruleset `Protect reconstruction integration` (`20549698`) last r
 
 GitHub ruleset state is the final authority for required checks. Do not infer required status from this list alone.
 
-For integration SHA `533119d74d7a48028266100c3e8b06e1f7007fbc`, all three checks passed in [Reconstruction CI run 31269103274](https://github.com/Chaos-kjj/finallybeidanci/actions/runs/31269103274).
+For integration SHA `dd8e2e17b486a912d8c9d2fa9b572faf28121f46`, all three checks passed in [Reconstruction CI run 31317174228](https://github.com/Chaos-kjj/finallybeidanci/actions/runs/31317174228).
 
 ## Completed Major Work
 
@@ -62,6 +62,7 @@ For integration SHA `533119d74d7a48028266100c3e8b06e1f7007fbc`, all three checks
 - V1 Historical Legacy Fields Validation completed; the frozen result is recorded in `RECOVERY_BACKLOG.md`.
 - V1-F1 governance sync completed by [PR #5](https://github.com/Chaos-kjj/finallybeidanci/pull/5).
 - V1-F1A Legacy Data Preservation + Repair Core completed by [PR #6](https://github.com/Chaos-kjj/finallybeidanci/pull/6); its exact-SHA post-merge integration CI passed.
+- V1-F1B Re-import Identity Continuity completed by [PR #8](https://github.com/Chaos-kjj/finallybeidanci/pull/8); exact-SHA post-merge integration CI passed in [run 31317174228](https://github.com/Chaos-kjj/finallybeidanci/actions/runs/31317174228).
 
 ## Current Active Reconstruction Task
 
@@ -70,8 +71,8 @@ For integration SHA `533119d74d7a48028266100c3e8b06e1f7007fbc`, all three checks
 | Slice | Status | Evidence or boundary |
 | --- | --- | --- |
 | V1-F1A — Legacy Data Preservation + Repair Core | **DONE** | PR #6 merged; exact-SHA post-merge integration CI passed |
-| V1-F1B — Re-import Identity Continuity | **NEXT** | Explicit product-owner selection for this durable handoff |
-| V1-F1C — Historical Occurrence Compatibility | **PENDING** | Not completed; not active |
+| V1-F1B — Re-import Identity Continuity | **DONE** | PR #8 merged; exact-SHA post-merge integration CI passed |
+| V1-F1C — Historical Occurrence Compatibility | **NEXT** | Next slice in the owner-selected A → B → C → D sequence |
 | V1-F1D — Backup Compatibility + Final Integration | **PENDING** | Requires A, B, and C complete |
 
 ### V1-F1 Dependency State
@@ -79,12 +80,12 @@ For integration SHA `533119d74d7a48028266100c3e8b06e1f7007fbc`, all three checks
 - A → B: **HARD DEPENDENCY — SATISFIED**.
 - A → C: **HARD DEPENDENCY — SATISFIED**.
 - B ↔ C: **NO HARD DEPENDENCY**.
-- A + B + C → D: **HARD DEPENDENCY**; only A is currently complete.
-- Recommended sequencing selected by the owner: A → B → C → D. The owner explicitly selected B before C.
+- A + B + C → D: **HARD DEPENDENCY**; A and B are complete, while C remains open.
+- Recommended sequencing selected by the owner: A → B → C → D. The B-before-C selection is satisfied; C is next.
 
-### V1-F1B Approved Objective
+### V1-F1B Completed Boundary
 
-V1-F1B is limited to re-import identity continuity:
+V1-F1B completed only re-import identity continuity:
 
 - Match the current SHA fingerprint.
 - Support trusted legacy SHA compatibility.
@@ -97,14 +98,13 @@ V1-F1B is limited to re-import identity continuity:
 
 ## Immediate Next Action
 
-**IMPLEMENT V1-F1B — Re-import Identity Continuity**
+**IMPLEMENT V1-F1C — Historical Occurrence Compatibility**
 
 This is the only active next action.
 
 ## Upcoming Queue
 
-- V1-F1C remains pending.
-- V1-F1D remains pending and blocked until A, B, and C are complete.
+- V1-F1D remains pending and blocked until V1-F1C is complete.
 - R2 is not active.
 - Architecture Audit has not started.
 
