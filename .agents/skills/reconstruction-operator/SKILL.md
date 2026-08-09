@@ -21,6 +21,7 @@ Own the complete safe engineering lifecycle. Do not send the product owner to th
 
 Pause and report one precise reason only when the state matches one of these categories:
 
+- `DURABLE STATE CONFLICT`: `CURRENT_STATE.md` conflicts with live Git/GitHub/CI/ruleset state or frozen governance/evidence. Do not choose one version or continue from stale state.
 - `AUTHORIZATION REQUIRED`: OAuth, device authorization, 2FA, SSO, or missing repository authorization cannot be completed without the owner.
 - `PRODUCT DECISION REQUIRED`: product behavior or acceptance requires an owner decision not already present in the approved task.
 - `DEVICE MANUAL VALIDATION REQUIRED`: a required physical-device experience cannot be automated. Never convert this to PASS without the required evidence.
@@ -49,6 +50,39 @@ Never:
 
 Before changing files, record the task ID, approved scope, source and target branches, expected files, required evidence, and stop conditions in the working plan. Keep the plan current through post-merge verification. Record the task branch, commit SHA, PR number and URL, check results, merge result, integration SHA, and post-merge result for the final report.
 
+## Durable start-of-task protocol
+
+Before every reconstruction task:
+
+1. Complete the non-mutating authentication and repository-identity preflight, then run `git fetch origin` before reading task state.
+2. Read these files completely from the latest reconstruction integration base, in this order:
+   - `AGENTS.md`
+   - `docs/reconstruction/CURRENT_STATE.md`
+   - `docs/reconstruction/RECONSTRUCTION_CONTRACT.md`
+   - `docs/reconstruction/RECOVERY_BACKLOG.md`
+   - `docs/reconstruction/VALIDATION_MATRIX.md`
+3. Reconcile `CURRENT_STATE.md` against live Git refs, GitHub pull requests, CI runs and checks, the active ruleset, and the backlog.
+4. If `CURRENT_STATE.md` conflicts with any live fact or frozen governance/evidence, output `DURABLE STATE CONFLICT` and stop. Never silently prefer stale `CURRENT_STATE.md`, choose between conflicting versions, or continue from conversation memory.
+
+`CURRENT_STATE.md` is an operational index and navigation layer. It does not replace or override frozen evidence or governance.
+
+## Durable evidence protocol
+
+Use this priority for engineering facts:
+
+1. Live Git, GitHub, CI, and ruleset state.
+2. `AGENTS.md`.
+3. `docs/reconstruction/RECONSTRUCTION_CONTRACT.md`.
+4. `docs/reconstruction/RECOVERY_BACKLOG.md`.
+5. `docs/reconstruction/VALIDATION_MATRIX.md`.
+6. Committed evidence and reports.
+7. `docs/reconstruction/CURRENT_STATE.md` as operational navigation.
+8. Conversation memory.
+
+Do not make a critical engineering judgment from conversation memory alone. Require at least one repository, Git, or GitHub source such as source code, a test, a committed governance document, Git history, a pull request, a CI run, a ruleset, or rescue evidence. If no such evidence exists, record `UNKNOWN` instead of completing the claim by inference.
+
+Claims that work is `DONE`, tested, merged, a required check, or a supported feature must be verified against live evidence at the time of use.
+
 ## Phase A — Establish base safety
 
 1. Run `gh auth status --hostname github.com`. Never request or print the token.
@@ -73,12 +107,13 @@ Do not run broad `git worktree prune`, `git gc`, or cleanup commands. Leave Code
 
 ## Phase C — Read governance
 
-Before implementation, read these files completely from the latest integration base:
+Before implementation, apply the durable start-of-task protocol and read these files completely from the latest integration base:
 
 1. `AGENTS.md`
-2. `docs/reconstruction/RECONSTRUCTION_CONTRACT.md`
-3. `docs/reconstruction/RECOVERY_BACKLOG.md`
-4. `docs/reconstruction/VALIDATION_MATRIX.md`
+2. `docs/reconstruction/CURRENT_STATE.md`
+3. `docs/reconstruction/RECONSTRUCTION_CONTRACT.md`
+4. `docs/reconstruction/RECOVERY_BACKLOG.md`
+5. `docs/reconstruction/VALIDATION_MATRIX.md`
 
 Extract only the current task's scope, dependencies, target modules, required tests, acceptance criteria, risk, rollback, PR boundary, Definition of Done, and device/manual requirements. Do not implement another backlog item incidentally.
 
@@ -238,7 +273,9 @@ After merge succeeds and post-merge integration CI is green:
 
 ## Phase Q — Keep status documentation truthful
 
-If completion makes `RECOVERY_BACKLOG.md` factually stale, update status only when the current task explicitly authorizes it. Otherwise create a separate documentation task, branch, and PR after the current lifecycle completes. Never rewrite frozen historical conclusions in `RECONSTRUCTION_CONTRACT.md`.
+After an implementation task merges and its exact-SHA post-merge integration CI passes, compare `CURRENT_STATE.md` with the verified result. If it is stale, automatically execute a separate docs-only status-sync task, branch, and pull request. Do not mix that update into the implementation pull request unless the original task explicitly authorizes it.
+
+A status sync may update only operational facts such as `DONE`, `IN PROGRESS`, and the single `NEXT` action. It must not rewrite frozen evidence or historical conclusions. If `RECOVERY_BACKLOG.md` is also factually stale, update it only when the status-sync scope is explicitly authorized; otherwise open another bounded documentation task. Never rewrite frozen historical conclusions in `RECONSTRUCTION_CONTRACT.md`.
 
 ## Report the terminal state
 
