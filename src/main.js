@@ -60,6 +60,7 @@ if (typeof globalThis.ReadableStream === 'function' && !globalThis.ReadableStrea
 const Core = globalThis.KangkangCore;
 const Learning = globalThis.KangkangLearning;
 const StudyStats = globalThis.KangkangStudyStats;
+const LegacyV1 = globalThis.KangkangLegacyV1;
 const Storage = globalThis.KangkangStorage;
 const Backup = globalThis.KangkangBackup;
 const Reader = globalThis.KangkangReader;
@@ -1256,24 +1257,26 @@ async function inspectImportedBook(type, source, fallbackTitle) {
   }
   return { title: fallbackTitle, author: '', coverDataUrl: '' };
 }
-async function findDuplicateBook(fingerprint, size = 0) {
+async function findDuplicateBook(identity, size = 0) {
   const books = await store.getAll('books');
+  const candidates = [];
   for (const raw of books) {
-    const book = BookLibrary.normalizeBookRecord(raw);
-    if (book.fingerprint === fingerprint) return book;
-    if (Number(size) > 0 && Number(book.size) > 0 && Number(book.size) !== Number(size)) continue;
-    let candidateBytes = null;
-    if (book.blob?.arrayBuffer) candidateBytes = new Uint8Array(await book.blob.arrayBuffer());
-    else if (book.text && ['text', 'html', 'markdown'].includes(book.type)) candidateBytes = new TextEncoder().encode(book.text);
-    if (!candidateBytes?.length) continue;
-    const existingFingerprint = await BookLibrary.fingerprintBytes(candidateBytes);
-    if (existingFingerprint === fingerprint) {
-      const migrated = { ...book, fingerprint: existingFingerprint };
-      await store.put('books', migrated);
-      return migrated;
+    let contentFingerprint = null;
+    // V1-F1A records carry an explicit compatibility envelope. Never hash
+    // their migrated/cleaned text to invent a historical source identity.
+    if (!raw.fingerprint && !raw.legacyV1) {
+      const book = BookLibrary.normalizeBookRecord(raw);
+      const sizeMatches = !(Number(size) > 0 && Number(book.size) > 0 && Number(book.size) !== Number(size));
+      if (sizeMatches) {
+        let candidateBytes = null;
+        if (book.blob?.arrayBuffer) candidateBytes = new Uint8Array(await book.blob.arrayBuffer());
+        else if (book.text && ['text', 'html', 'markdown'].includes(book.type)) candidateBytes = new TextEncoder().encode(book.text);
+        if (candidateBytes?.length) contentFingerprint = await BookLibrary.fingerprintBytes(candidateBytes);
+      }
     }
+    candidates.push({ book: raw, contentFingerprint });
   }
-  return null;
+  return LegacyV1.resolveLegacyReimportIdentity(candidates, identity);
 }
 
 function readFileBytes(file, { signal, onProgress } = {}) {
@@ -1390,34 +1393,56 @@ async function importBook(file) {
     const sourceBytes = await readFileBytes(file, { signal: controller.signal, onProgress: (loaded, total) => { if (bookImportController === controller) setText('book-import-progress', total ? `读取文件：${Math.round((loaded / total) * 100)}%` : '读取文件…'); } });
     if (controller.signal.aborted) throw Object.assign(new Error('导入已取消'), { name: 'AbortError' });
     const fingerprint = await BookLibrary.fingerprintBytes(sourceBytes);
-    const duplicate = await findDuplicateBook(fingerprint, sourceBytes.byteLength);
-    if (duplicate) {
-      await refreshBookList(); await openBook(duplicate.id);
-      setReaderNotice(`已打开书架中的《${duplicate.title}》，没有创建重复项。`);
-      return;
-    }
+    const fallbackFileHash = LegacyV1.createLegacyFallbackFileHash(sourceBytes, { size: file.size, lastModified: file.lastModified });
+    const sourceIdentity = { fingerprint, fallbackFileHash };
+    let duplicate = await findDuplicateBook(sourceIdentity, sourceBytes.byteLength);
     const isTextual = ['text', 'html', 'markdown'].includes(type);
     const decodedSource = isTextual ? new TextDecoder().decode(sourceBytes) : sourceBytes.buffer;
     const text = isTextual ? decodedSource : '';
     const fallbackTitle = baseBookTitle(file.name);
     const metadata = await inspectImportedBook(type, decodedSource, fallbackTitle);
     const now = Date.now();
-    const book = BookLibrary.normalizeBookRecord({
-      id: BookLibrary.stableBookId(fingerprint), title: metadata.title || fallbackTitle, author: metadata.author || '', fileName: file.name, type,
-      mime: file.type || 'application/octet-stream', size: sourceBytes.byteLength, fingerprint,
+    const mime = file.type || 'application/octet-stream';
+    const blob = new Blob([sourceBytes], { type: mime });
+    const sourceBook = {
+      title: metadata.title || fallbackTitle,
+      author: metadata.author || '',
+      fileName: file.name,
+      type,
+      format: BookLibrary.formatLabel(type),
+      mime,
+      size: sourceBytes.byteLength,
+      fingerprint,
       coverDataUrl: metadata.coverDataUrl || BookLibrary.deterministicTextCover({ title: metadata.title || fallbackTitle, author: metadata.author || '', type }),
-      blob: new Blob([sourceBytes], { type: file.type || 'application/octet-stream' }), text,
-      progress: { version: 2, chapterIndex: 0, pageIndex: 0, pageCount: 1, pdfPage: 1, percent: 0, location: { format: type, progression: 0 }, updatedAt: null },
-      notes: [], bookmarks: [], createdAt: now, updatedAt: now, lastReadAt: null
-    });
+      blob,
+      text
+    };
+
+    // Re-read all identities after source validation. A new or changed match
+    // during parsing must not turn into a duplicate or stale-data overwrite.
+    const revalidated = await findDuplicateBook(sourceIdentity, sourceBytes.byteLength);
+    if (duplicate && (!revalidated || revalidated.book.id !== duplicate.book.id)) {
+      throw new Error('书籍身份在导入期间发生变化，已停止导入；原数据未修改。');
+    }
+    if (!duplicate && revalidated) duplicate = revalidated;
+
+    const book = duplicate
+      ? LegacyV1.hydrateLegacyReimportBook(revalidated.book, sourceBook)
+      : BookLibrary.normalizeBookRecord({
+          ...sourceBook,
+          id: BookLibrary.stableBookId(fingerprint),
+          progress: { version: 2, chapterIndex: 0, pageIndex: 0, pageCount: 1, pdfPage: 1, percent: 0, location: { format: type, progression: 0 }, updatedAt: null },
+          notes: [], bookmarks: [], createdAt: now, updatedAt: now, lastReadAt: null
+        });
     // Parse before writing IndexedDB so malformed documents never become
     // undeletable rows in the visible library.
-    const validator = createReaderEngine(book);
+    const validator = createReaderEngine(duplicate && isTextual ? { ...book, text } : book);
     try { await validator.open(); } finally { await validator.close?.(); }
     await store.put('books', book);
     await refreshBookList();
     if ($('book-selector')) $('book-selector').value = book.id;
     await openBook(book.id);
+    if (duplicate) setReaderNotice(`已恢复书架中的《${book.title}》，没有创建重复项。`);
   } catch (error) { if (bookImportController === controller) setReaderNotice(error.name === 'AbortError' ? '导入已取消，未留下半成品。' : `导入失败：${error.message}`, error.name !== 'AbortError'); }
   finally {
     if (bookImportController !== controller) return;
