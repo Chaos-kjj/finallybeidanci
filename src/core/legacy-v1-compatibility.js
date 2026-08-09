@@ -7,6 +7,7 @@
     const SHA_BOOK_KEY_RE = /^hash:([0-9a-fA-F]{64})$/;
     const FALLBACK_RE = /^fallback-.+$/;
     const FALLBACK_BOOK_KEY_RE = /^hash:(fallback-.+)$/;
+    const CURRENT_FINGERPRINT_RE = /^(?:[0-9a-fA-F]{64}|[0-9a-fA-F]{16})$/;
     const OCCURRENCE_RE = /^\d+:\d+$/;
 
     function hasOwn(value, key) {
@@ -128,6 +129,176 @@
             reason: availablePart ? 'identity-not-trusted' : 'identity-missing',
             conflicts: []
         };
+    }
+
+    function sourceBytes(value) {
+        if (value instanceof Uint8Array) return value;
+        if (value instanceof ArrayBuffer) return new Uint8Array(value);
+        if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        throw new TypeError('legacy fallback identity requires source bytes');
+    }
+
+    function createLegacyFallbackFileHash(value, { size = 0, lastModified = 0 } = {}) {
+        const bytes = sourceBytes(value);
+        const step = Math.max(1, Math.floor(bytes.length / 65536));
+        let hash = 2166136261;
+        for (let index = 0; index < bytes.length; index += step) {
+            hash ^= bytes[index];
+            hash = Math.imul(hash, 16777619);
+        }
+        return [
+            'fallback',
+            (hash >>> 0).toString(36),
+            size || bytes.length,
+            lastModified || 0
+        ].join('-');
+    }
+
+    function normalizeCurrentFingerprint(value) {
+        return typeof value === 'string' && CURRENT_FINGERPRINT_RE.test(value) ? value.toLowerCase() : null;
+    }
+
+    function envelopeIdentity(envelope) {
+        if (!envelope || typeof envelope !== 'object') return classifyLegacyIdentity();
+        const classified = classifyLegacyIdentity({ fileHash: envelope.fileHash, bookKey: envelope.bookKey });
+        if (classified.kind !== 'missing') return classified;
+        if (envelope.identityKind === 'trusted-sha' && SHA256_RE.test(envelope.identityValue || '')) {
+            return {
+                kind: 'trusted-sha',
+                value: String(envelope.identityValue).toLowerCase(),
+                fingerprint: String(envelope.identityValue).toLowerCase(),
+                reason: envelope.identityReason || 'trusted-sha-envelope',
+                conflicts: []
+            };
+        }
+        if (envelope.identityKind === 'legacy-fallback' && FALLBACK_RE.test(envelope.identityValue || '')) {
+            return {
+                kind: 'legacy-fallback',
+                value: envelope.identityValue,
+                fingerprint: null,
+                reason: envelope.identityReason || 'legacy-fallback-envelope',
+                conflicts: []
+            };
+        }
+        return classified;
+    }
+
+    function envelopeHasConflict(envelope) {
+        return Boolean(envelope && (
+            envelope.identityKind === 'conflict'
+            || (Array.isArray(envelope.conflicts?.identities) && envelope.conflicts.identities.length > 0)
+        ));
+    }
+
+    function evidenceMatchesSource(evidence, { fingerprint, fallbackFileHash }) {
+        const values = [evidence?.normalizedValue, evidence?.value].filter(value => typeof value === 'string');
+        for (const value of values) {
+            const normalized = normalizeCurrentFingerprint(value);
+            if (normalized && normalized === fingerprint) return true;
+            if (fallbackFileHash && value === fallbackFileHash) return true;
+            if (value.startsWith('hash:')) {
+                const digest = value.slice(5);
+                const normalizedDigest = normalizeCurrentFingerprint(digest);
+                if (normalizedDigest && normalizedDigest === fingerprint) return true;
+                if (fallbackFileHash && digest === fallbackFileHash) return true;
+            }
+        }
+        return false;
+    }
+
+    function legacyReimportError(code, candidateIds) {
+        const ids = [...new Set(candidateIds.map(value => String(value || '<missing-id>')))].sort((left, right) => left.localeCompare(right));
+        const error = new Error(code === 'LEGACY_REIMPORT_CONFLICT'
+            ? '历史书籍身份信息存在冲突，已停止导入；原数据未修改。'
+            : '检测到多个可能对应的历史书籍，已停止导入以避免错误合并。');
+        error.name = 'LegacyReimportIdentityError';
+        error.code = code;
+        error.candidateIds = ids;
+        return error;
+    }
+
+    function resolveLegacyReimportIdentity(candidates = [], { fingerprint, fallbackFileHash } = {}) {
+        const sourceFingerprint = normalizeCurrentFingerprint(fingerprint);
+        if (!sourceFingerprint) throw new TypeError('current source fingerprint is required');
+        const matchesById = new Map();
+        const conflictIds = [];
+
+        for (const candidate of candidates || []) {
+            const book = candidate?.book;
+            if (!book || typeof book !== 'object') continue;
+            const id = book.id === undefined || book.id === null || String(book.id) === '' ? '' : String(book.id);
+            const envelope = book.legacyV1;
+            const legacyIdentity = envelopeIdentity(envelope);
+            const matchedBy = [];
+            const currentFingerprint = normalizeCurrentFingerprint(book.fingerprint);
+
+            if (currentFingerprint === sourceFingerprint) matchedBy.push('current-fingerprint');
+            if (legacyIdentity.kind === 'trusted-sha' && legacyIdentity.fingerprint === sourceFingerprint) {
+                matchedBy.push('trusted-legacy-sha');
+            }
+            if (legacyIdentity.kind === 'legacy-fallback' && fallbackFileHash && legacyIdentity.value === fallbackFileHash) {
+                matchedBy.push('legacy-fallback');
+            }
+
+            const hasDeclaredIdentity = Boolean(book.fingerprint)
+                || Boolean(envelope)
+                || legacyIdentity.kind !== 'missing';
+            const contentFingerprint = normalizeCurrentFingerprint(candidate?.contentFingerprint);
+            if (!hasDeclaredIdentity && contentFingerprint === sourceFingerprint) {
+                matchedBy.push('stored-content-fingerprint');
+            }
+
+            const matchingConflictEvidence = envelopeHasConflict(envelope) && (
+                matchedBy.length > 0
+                || (envelope.conflicts?.identities || []).some(item => evidenceMatchesSource(item, {
+                    fingerprint: sourceFingerprint,
+                    fallbackFileHash
+                }))
+            );
+            if (matchingConflictEvidence) {
+                conflictIds.push(id);
+                continue;
+            }
+            if (!matchedBy.length) continue;
+            if (!id) {
+                conflictIds.push(id);
+                continue;
+            }
+
+            const existing = matchesById.get(id);
+            if (!existing) {
+                matchesById.set(id, { book, matchedBy: [...matchedBy] });
+                continue;
+            }
+            for (const evidence of matchedBy) {
+                if (!existing.matchedBy.includes(evidence)) existing.matchedBy.push(evidence);
+            }
+        }
+
+        if (conflictIds.length) throw legacyReimportError('LEGACY_REIMPORT_CONFLICT', conflictIds);
+        const matches = [...matchesById.values()];
+        if (matches.length > 1) throw legacyReimportError('LEGACY_REIMPORT_AMBIGUOUS', matches.map(item => item.book.id));
+        return matches[0] || null;
+    }
+
+    function hasTextValue(value) {
+        return typeof value === 'string' && value.length > 0;
+    }
+
+    function hydrateLegacyReimportBook(book, source = {}) {
+        if (!book || typeof book !== 'object' || book.id === undefined || book.id === null || String(book.id) === '') {
+            throw new TypeError('historical DB6 book is required');
+        }
+        const fingerprint = normalizeCurrentFingerprint(source.fingerprint);
+        if (!fingerprint) throw new TypeError('validated source fingerprint is required');
+        const hydrated = { ...book, id: book.id, fingerprint };
+        for (const field of ['blob', 'type', 'format', 'mime', 'size']) {
+            if (hasOwn(source, field)) hydrated[field] = source[field];
+        }
+        for (const field of ['title', 'author', 'fileName', 'text', 'coverDataUrl']) {
+            if (!hasTextValue(book[field]) && hasOwn(source, field)) hydrated[field] = source[field];
+        }
+        return hydrated;
     }
 
     function classifyLegacyOccurrences(value) {
@@ -299,6 +470,9 @@
         SHA256_RE,
         OCCURRENCE_RE,
         classifyLegacyIdentity,
+        createLegacyFallbackFileHash,
+        resolveLegacyReimportIdentity,
+        hydrateLegacyReimportBook,
         classifyLegacyOccurrences,
         prepareLegacyV1Book,
         reconcileLegacyV1Book
